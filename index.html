@@ -246,9 +246,12 @@ const CONFIG = {
   view: {
     fitHalfHeight : 1.045,  // 画面の縦半分に収める world 単位の高さ（容器は 1.0）
     camDist       : 7.5,    // カメラ距離。長めにして歪みを抑える
-    maxTubeAspect : 0.32,   // 容器の太さの上限（幅/高さ）。
+    maxTubeAspect : 0.30,   // 容器の太さの上限（幅/高さ）。
                             // 太いと空気の柱が切れる余地がなくなるので、
                             // 画面が横に広くてもここまでに留める。
+    fluidScale    : 0.5,    // 流体の深度・厚みを描く解像度（画面に対する比）。
+                            // 下げると同じ手数で広い範囲を均せるので、粒の
+                            // 凹凸が消えてつながった液体に見える。
     maxDpr        : 2,      // 解像度の上限（レイマーチが重いので抑える）
     exposure      : 0.92,
   },
@@ -294,11 +297,14 @@ const CONFIG = {
   //   通れなくなり、液体の塊と空気の塊が交互に通る（＝泡ができる）。
   neck: {
     lenRatio  : 0.50,   // 通路の長さ / 直径
-    holeRatio : 0.40,   // 通路の半径 / 空洞の半径
+    holeRatio : 0.52,   // 通路の半径 / 空洞の半径
                         // 細くすると液体と空気がすれ違えず交換が止まる。
                         // この値は実測（交換量）で決めたもの。
-    minCells  : 4.5,    // 通路の半径の下限（粒子間隔の倍数）
-                        // ここを割ると液体と空気がすれ違えず、交換が止まる
+    minCells  : 8.0,    // 通路の半径の下限（粒子間隔の倍数）。
+                        // ここを割ると液体と空気がすれ違えず交換が止まる。
+                        // 実測では 6.5 で停止、8.7 で安定して通った。
+    offset    : -0.28,  // 仕切りの高さ（0が中央）。下げると上の部屋が高くなり、
+                        // 空気の柱が切れるのに必要な長さを稼げる
     taper     : 0.10,   // 出入口のひろがり
   },
 
@@ -319,7 +325,7 @@ const CONFIG = {
 
     // 液体のりのような、重くはないがとても粘る液体を想定している。
     // 重力は控えめにし、粘りは下の viscosity（粒子どうしの速度の均し）で作る。
-    gravity   : 0.55,
+    gravity   : 0.95,
     damping   : 0.40,    // 全体の減衰は補助。主役は viscosity
     maxVel    : 0.45,
 
@@ -341,7 +347,7 @@ const CONFIG = {
     wallFricGas: 0.20,   // 空気は壁を濡らさないので滑る
     wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
     radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
-    drawRadius: 1.05,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
+    drawRadius: 1.25,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
   },
 };
 /* ==========================================================================
@@ -369,7 +375,8 @@ const SHAPE_BUILDERS = {
     const s0     = Math.cbrt(Math.PI*R*R*2*H*0.9/Math.max(targetN, 1));
     const holeR  = Math.max(R*K.holeRatio, s0*K.minCells);
     const plate  = holeR*K.lenRatio;              // 通路の半分の長さ
-    const vol    = Math.PI*R*R*2*(H - plate);
+    const oy     = Math.max(-H + plate*2.5, Math.min(H - plate*2.5, K.offset));
+    const vol    = Math.PI*R*R*(2*H - 2*plate);
     const s      = Math.cbrt(vol/Math.max(targetN, 1));
 
     return {
@@ -377,14 +384,15 @@ const SHAPE_BUILDERS = {
       bound : { r: outerR*1.03, h: 1.02 },        // レイマーチの打ち切り用
       cavityBound : { r: R, h: H },
       plateHalf   : plate,
-      orifice     : { p: [0, 0, 0], r: holeR },
+      orifice     : { p: [0, oy, 0], r: holeR },
       spacing     : s,
 
       outer : { op:'roundedCylinder', r: outerR, h: 1.0, round: 0.004 },
 
       cavity: { op:'sub', k: 0.005,
         a: { op:'roundedCylinder', r: R, h: H, round: 0.004 },
-        b: { op:'plateWithHole', halfThick: plate, holeR: holeR, taper: K.taper, k: 0.005 },
+        b: { op:'plateWithHole', halfThick: plate, holeR: holeR, taper: K.taper, k: 0.005,
+             at: [0, oy, 0] },
       },
     };
   },
@@ -1395,7 +1403,8 @@ struct Uni {
   mat      : vec4f,   // x = ガラス屈折率, y = 液体屈折率, z = ガラス粗さ, w = 露出
   res      : vec4f,   // xy = 解像度, zw = 1/解像度
   bnd      : vec4f,   // x = 境界円筒の半径, y = 同 半高, z = ミップ最大, w = 背景の明るさ
-  fluid    : vec4f,   // x = 粒子の表示半径, y = 厚み係数, z = 平滑化半径, w = 遠方値
+  fluid    : vec4f,   // x = 粒子の表示半径, y = 厚み係数, z = 平滑化半径(流体画素), w = 遠方値
+  fres     : vec4f,   // xy = 流体バッファの解像度, zw = その逆数
 };
 @group(0) @binding(0) var<uniform> U: Uni;
 `;
@@ -1457,9 +1466,9 @@ fn envStudio(d: vec3f) -> vec3f {
   }
 
   c += softbox(d, vec3f(-2.3,  2.6,  2.0), 1.55, 1.15, 0.05) * vec3f(8.5, 8.6, 9.0);
-  c += softbox(d, vec3f( 2.9,  0.7,  1.9), 0.11, 1.70, 0.04) * vec3f(7.0, 7.2, 8.0);
-  c += softbox(d, vec3f( 2.2, -0.5, -2.2), 0.09, 1.30, 0.05) * vec3f(3.2, 3.3, 3.9);
-  c += softbox(d, vec3f(-2.6, -0.2, -1.6), 0.08, 1.10, 0.05) * vec3f(2.2, 2.3, 2.8);
+  c += softbox(d, vec3f( 2.9,  0.7,  1.9), 0.11, 1.70, 0.10) * vec3f(7.0, 7.2, 8.0);
+  c += softbox(d, vec3f( 2.2, -0.5, -2.2), 0.09, 1.30, 0.12) * vec3f(3.2, 3.3, 3.9);
+  c += softbox(d, vec3f(-2.6, -0.2, -1.6), 0.08, 1.10, 0.12) * vec3f(2.2, 2.3, 2.8);
   c += softbox(d, vec3f(-0.4,  0.8, -3.2), 2.40, 2.00, 0.12) * vec3f(0.30, 0.32, 0.38);
   return c;
 }
@@ -1595,7 +1604,7 @@ fn projUV(p: vec3f) -> vec3f {           // xy = uv(y上), z = ビュー深度
   return vec3f(c.xy/c.w*0.5 + vec2f(0.5, 0.5), c.w);
 }
 fn texel(uv: vec2f) -> vec2i {
-  let r = U.res.xy;
+  let r = U.fres.xy;
   return vec2i(clamp(vec2f(uv.x, 1.0 - uv.y)*r, vec2f(0.0), r - vec2f(1.0)));
 }
 // 相ごとの「前面の深度」と「厚み」。厚みは半解像度で線形に読むので段差が出ない。
@@ -1610,7 +1619,9 @@ fn gasAtUV(uv: vec2f) -> vec2f {
 // 視線方向の距離なので、斜めの面で踏み越えないよう安全側に縮める
 fn slabDist(L: vec2f, z: f32) -> f32 {
   if (L.x > U.fluid.w*0.5) { return 1.0; }
-  return max(L.x - z, z - (L.x + max(L.y, U.fluid.x*0.8)))*0.45;
+  // 薄いところでも最低限の奥行きを持たせる。ここが薄すぎると
+  // 粒が見えたり消えたりして点滅する。
+  return max(L.x - z, z - (L.x + max(L.y, U.fluid.x*1.8)))*0.45;
 }
 
 fn viewPosAt(uv: vec2f, z: f32) -> vec3f {
@@ -1622,7 +1633,10 @@ fn toWorldN(n: vec3f) -> vec3f {
 }
 // 深度の差分から面の法線を起こす。前後どちらか近いほうの差分を採って輪郭を保つ。
 fn normalFromDepth(q: vec3f, isGas: bool) -> vec3f {
-  let e = U.res.zw;
+  // 1画素の差分だと粒ひとつぶんの膨らみがそのまま法線に出て、
+  // つながった液体ではなく玉の集まりに見えてしまう。
+  // 粒の見かけの大きさに合わせて差分の幅を広げ、面として均す。
+  let e = U.fres.zw*max(U.fluid.z*0.60, 2.0);
   var z   = 0.0; var zx1 = 0.0; var zx0 = 0.0; var zy1 = 0.0; var zy0 = 0.0;
   if (isGas) {
     z   = gasAtUV(q.xy).x;
@@ -1800,6 +1814,9 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
   var thr = vec3f(1.0, 1.0, 1.0);
   var rad = vec3f(0.0, 0.0, 0.0);
   var settled = false;
+  // すれすれの角度で屈折したレイは大きく広がる。そのぶん環境マップを
+  // ぼかして拾わないと、細い光源を拾って壁ぎわがギラつく。
+  var spread = 0.0;
 
   let gExt = U.glsA.a*(vec3f(1.0, 1.0, 1.0) - U.glsA.rgb);
   let lExt = U.liqA.a*(vec3f(1.0, 1.0, 1.0) - U.liqA.rgb);
@@ -1819,7 +1836,7 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
 
     if (!hit) {
       if (med == MED_OUT) { rad += thr*bgColor(dir)*U.bnd.w; }
-      else                { rad += thr*envS(dir, 0.0); }
+      else                { rad += thr*envS(dir, spread*U.bnd.z); }
       settled = true;
       break;
     }
@@ -1831,10 +1848,12 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
     var nrm: vec3f;
     if (abs(f.body) <= abs(f.liq)) {
       nrm = gradBody(pos);                              // 容器の内壁
-    } else if (-f.gasS >= f.cav && -f.gasS >= f.liqS) {
+    } else if (f.cav > -U.fluid.x*1.6) {
+      // 壁のすぐそばは必ず壁の法線を使う。画素ごとに壁と液面の法線が
+      // 切り替わると、壁ぎわに縦縞が出てしまう。
+      nrm = gradCav(pos);
+    } else if (-f.gasS >= f.liqS) {
       nrm = normalFromDepth(projUV(pos), true);         // 泡の面
-    } else if (f.cav >= f.liqS) {
-      nrm = gradCav(pos);                               // 液体が壁に接している面
     } else {
       nrm = normalFromDepth(projUV(pos), false);        // 液体の自由表面
     }
@@ -1862,8 +1881,10 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
 
     let rough = select(0.0, U.mat.z, med == MED_GLASS || medNext == MED_GLASS);
     let F = fres(f0of(n1, n2), cosi);
-    rad += thr*F*envS(reflect(dir, nrm), rough*U.bnd.z*1.6);
+    rad += thr*F*envS(reflect(dir, nrm), max(rough*1.6, spread*0.6)*U.bnd.z);
     thr *= (1.0 - F);
+    // 入射が浅いほどレイは広がる
+    spread = min(spread + (1.0 - cosi)*0.55, 1.0);
 
     dir = normalize(eta*dir + (eta*cosi - sqrt(kk))*nrm);
     pos = pos + dir*(EPS*4.0);
@@ -1871,13 +1892,13 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
 
     if (med == MED_OUT) {
       // 物体を抜けて背景へ。透過光は明るい環境マップから拾う
-      rad += thr*envS(dir, 0.0);
+      rad += thr*envS(dir, spread*U.bnd.z);
       settled = true;
       break;
     }
     if (max(thr.r, max(thr.g, thr.b)) < 0.004) { settled = true; break; }
   }
-  if (!settled) { rad += thr*envS(dir, 0.0)*0.7; }
+  if (!settled) { rad += thr*envS(dir, max(spread, 0.3)*U.bnd.z)*0.7; }
   return vec4f(rad, 1.0);
 }
 `;
@@ -1962,7 +1983,7 @@ const WGSL_SMOOTH = WGSL_COMMON + WGSL_UNI + `
 //   捨てると縁で重みが偏って輪郭が溶けるが、丸めると平均が端に寄るだけなので
 //   粒のでこぼこだけ消えて輪郭は立ったまま残る。
 fn smoothDir(fc: vec2f, dir: vec2i) -> f32 {
-  let res = vec2i(U.res.xy);
+  let res = vec2i(U.fres.xy);
   let t0  = vec2i(floor(fc));
   let z0  = textureLoad(src, t0, 0).r;
   if (z0 > U.fluid.w*0.5) { return z0; }
@@ -2202,7 +2223,7 @@ const ENV_PRESETS = { studio: 0, room: 1, sunset: 2 };
 const Gpu = {
   ok: false,
   dev: null, ctx: null, fmt: null, adapterInfo: {},
-  ub: null, ubData: new Float32Array(92),
+  ub: null, ubData: new Float32Array(96),
   w: 0, h: 0,
 
   async init(canvas){
@@ -2226,7 +2247,7 @@ const Gpu = {
       magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
       addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
     });
-    this.ub    = dev.createBuffer({ size: 368, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.ub    = dev.createBuffer({ size: 384, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.envUB = dev.createBuffer({ size: 16,  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     // --- 環境キューブマップ ---
@@ -2363,17 +2384,22 @@ const Gpu = {
     const mkTex = (format, usage) => dev.createTexture({ size:[w, h], format, usage });
     const RT = GPUTextureUsage.RENDER_ATTACHMENT, TB = GPUTextureUsage.TEXTURE_BINDING;
 
-    const half = (fmt) => dev.createTexture({
-      size:[Math.max(1, w >> 1), Math.max(1, h >> 1)], format: fmt, usage: RT | TB });
+    // 流体の面は画面より低い解像度で作る。平滑化の手数を増やさずに
+    // 広い範囲を均せるので、粒の凹凸が消えてつながった液体に見える。
+    const fs = CONFIG.view.fluidScale;
+    const fw = Math.max(8, Math.round(w*fs));
+    const fh = Math.max(8, Math.round(h*fs));
+    this.fw = fw; this.fh = fh;
+    const fTex = (fmt) => dev.createTexture({ size:[fw, fh], format: fmt, usage: RT | TB });
 
     this.hdrTex   = mkTex('rgba16float',  RT | TB);
-    this.liqA     = mkTex('r32float',     RT | TB);   // 液体の前面の深度
-    this.liqB     = mkTex('r32float',     RT | TB);   // 平滑化の作業用
-    this.gasA     = mkTex('r32float',     RT | TB);   // 空気の前面の深度
-    this.gasB     = mkTex('r32float',     RT | TB);
-    this.thickLiq = half('r16float');
-    this.thickGas = half('r16float');
-    this.depthTex = mkTex('depth32float', RT);
+    this.liqA     = fTex('r32float');   // 液体の前面の深度
+    this.liqB     = fTex('r32float');   // 平滑化の作業用
+    this.gasA     = fTex('r32float');   // 空気の前面の深度
+    this.gasB     = fTex('r32float');
+    this.thickLiq = fTex('r16float');
+    this.thickGas = fTex('r16float');
+    this.depthTex = dev.createTexture({ size:[fw, fh], format:'depth32float', usage: RT });
 
     this.hdrView   = this.hdrTex.createView();
     this.liqAView  = this.liqA.createView();
@@ -2595,14 +2621,17 @@ function writeUniforms(time){
   U[84]=SHAPE.bound.r; U[85]=SHAPE.bound.h;
   U[86]=CONFIG.env.mipCount - 1; U[87]=CONFIG.env.bgGain;
 
-  // 流体の描画パラメータ
+  // 流体の描画パラメータ（平滑化の半径は「流体バッファの画素」で数える）
+  const fw = Gpu.fw || Math.max(8, Math.round(renderW*CONFIG.view.fluidScale));
+  const fh = Gpu.fh || Math.max(8, Math.round(renderH*CONFIG.view.fluidScale));
   const s  = Sim.spacing || 0.02;
   const pr = CONFIG.sim.drawRadius*s;
-  const screenR = pr/(CONFIG.view.camDist*CAM.tanHalf)*(renderH*0.5);
+  const screenR = pr/(CONFIG.view.camDist*CAM.tanHalf)*(fh*0.5);
   U[88]=pr;
   U[89]=3*s*s*s/(4*Math.PI*pr*pr*pr);
-  U[90]=Math.max(3, Math.min(18, Math.round(screenR*2.6)));
+  U[90]=Math.max(4, Math.min(30, Math.round(screenR*3.0)));
   U[91]=FAR;
+  U[92]=fw; U[93]=fh; U[94]=1/fw; U[95]=1/fh;
 
   Gpu.dev.queue.writeBuffer(Gpu.ub, 0, U);
 }
