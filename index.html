@@ -189,7 +189,7 @@
 
   <div class="row">
     <label>濃さ <b id="vAbs"></b></label>
-    <input type="range" id="sAbs" min="2" max="22" step="0.1">
+    <input type="range" id="sAbs" min="0" max="20" step="0.1">
   </div>
 
   <div class="row">
@@ -198,8 +198,8 @@
   </div>
 
   <div class="row">
-    <label>泡の出やすさ <b id="vBub"></b></label>
-    <input type="range" id="sBub" min="0.3" max="2.6" step="0.05">
+    <label>界面の張り <b id="vBub"></b></label>
+    <input type="range" id="sBub" min="0.2" max="4.0" step="0.05">
   </div>
 
   <div class="row">
@@ -241,34 +241,38 @@ const DEBUG = QS.has('debug');
 
 const CONFIG = {
   // --- カメラと描画 ---
+  //   容器の外形の半高を 1 とし、画面の縦にそれがちょうど収まるようにする。
+  //   横幅は容器の半径が画面比率と一致するので、画面いっぱいが容器になる。
   view: {
-    fitHalfHeight : 1.32,   // 画面の縦半分に収める world 単位の高さ
-    camDist       : 6.6,    // カメラ距離
+    fitHalfHeight : 1.045,  // 画面の縦半分に収める world 単位の高さ（容器は 1.0）
+    camDist       : 7.5,    // カメラ距離。長めにして歪みを抑える
+    maxTubeAspect : 0.32,   // 容器の太さの上限（幅/高さ）。
+                            // 太いと空気の柱が切れる余地がなくなるので、
+                            // 画面が横に広くてもここまでに留める。
     maxDpr        : 2,      // 解像度の上限（レイマーチが重いので抑える）
     exposure      : 0.92,
   },
 
-  // --- ガラス ---
+  // --- 容器（アクリル樹脂）---
   glass: {
-    ior       : 1.52,
-    absorb    : 0.55,                 // 厚みに応じた吸収の強さ
-    color     : [0.86, 0.95, 0.97],   // 吸収後に残る色（わずかに青緑）
-    roughness : 0.035,
+    ior       : 1.49,                 // アクリル
+    absorb    : 0.22,                 // ほとんど無色
+    color     : [0.95, 0.98, 0.99],
+    roughness : 0.020,
   },
 
   // --- 液体 ---
   liquid: {
     ior    : 1.47,
-    color  : [0.13, 0.50, 0.96],  // この色が残る（= 補色が吸収される）
-    absorb : 8.0,                 // 吸収の強さ。筒が細く光路が短いので大きめ
-    level  :  0.30,               // 重力軸に沿った液面の位置（段階1は静止）
+    color  : [0.90, 0.95, 0.98],  // この色が残る（= 補色が吸収される）
+    absorb : 3.0,                 // 既定はほぼ無色透明（うっすら色がつく程度）
   },
 
   // --- レイマーチの打ち切り ---
   march: {
     glassHit  : 72,     // ガラス前面を探す
     inGlass   : 36,     // ガラスの中を抜ける
-    cavity    : 80,     // 空洞の中を進む（液面か背面ガラスまで）
+    cavity    : 56,     // 空洞の中を進む（液面か背面ガラスまで）
     inLiquid  : 64,     // 液体の中を抜ける
     eps       : 0.0010,
     normalEps : 0.0015,
@@ -284,53 +288,62 @@ const CONFIG = {
 
   shape: QS.get('shape') || 'oozeTube',
 
-  // --- 流体（3D Position Based Fluids） ---
-  sim: {
-    particles : 0,       // 目標粒子数。0 なら端末を見て決める（下の pickParticles）
-    substeps  : 2,       // 1フレームあたりの物理ステップ
-    iters     : 3,       // 密度拘束の反復回数
-    hFactor   : 2.0,     // 平滑化半径 = hFactor × 粒子間隔
-    cellCap   : 32,      // 1セルに入る粒子の上限（溢れた分は近傍から漏れる）
-
-    gravity   : 1.2,     // 正規化空間での重力。粘性とあわせて垂れる速さを決める
-    damping   : 6.0,     // 速度の全体的な減衰（1/s）。粘る感じを出す主役
-    maxVel    : 0.50,
-
-    relax     : 0.012,   // CFM（拘束の緩和）。λの分母に対する割合
-    sCorrK    : 0.025,   // 人工圧力。粒子の塊りつきを防ぐ。λの大きさに対する割合
-    sCorrN    : 4.0,
-    sCorrQ    : 0.22,    // Δq = sCorrQ × h
-
-    viscosity : 0.85,    // XSPH。高いほど粘る
-    cohesion  : 1.20,    // 凝集（表面張力）。細い筋と水滴をつくる
-    adhesion  : 0.22,    // 壁への付着。上の部屋の壁に膜を残す
-    wallFric  : 0.88,    // 壁に触れている間の接線方向の減衰
-    wallBand  : 1.6,     // 付着が効く距離（粒子間隔の倍数）
-    radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
-    drawRadius: 0.92,    // 描画時の球の半径（粒子間隔の倍数）
-    histBins  : 64,      // 重力軸方向の分布を測るビン数
+  // --- 仕切りの通路 ---
+  //   薄い板に空いた穴だと、液体と空気がすれ違って同時に通れてしまい、
+  //   泡にならない。実物のように厚みのある通路にすると、どちらか一方しか
+  //   通れなくなり、液体の塊と空気の塊が交互に通る（＝泡ができる）。
+  neck: {
+    lenRatio  : 0.50,   // 通路の長さ / 直径
+    holeRatio : 0.40,   // 通路の半径 / 空洞の半径
+                        // 細くすると液体と空気がすれ違えず交換が止まる。
+                        // この値は実測（交換量）で決めたもの。
+    minCells  : 4.5,    // 通路の半径の下限（粒子間隔の倍数）
+                        // ここを割ると液体と空気がすれ違えず、交換が止まる
+    taper     : 0.10,   // 出入口のひろがり
   },
 
-  // --- 泡 ---
-  bubble: {
-    max       : 64,
-    buoy      : 1.00,    // 浮力（重力に対する比）
-    drag      : 0.075,   // 抗力。終端速度は半径の2乗に比例する
-    wobble    : 0.55,    // 横揺れ。1個ずつ違う経路になる
-    push      : 0.60,    // 泡同士の押し退け
-    draft     : 0.30,    // 直上の泡に引かれる（連なって昇る）
-    mergeRate : 2.2,     // 重なっているときの合体しやすさ（1/s）
-    sizeMean  : 1.00,    // 穴の半径に対する倍率
-    sizeSigma : 0.45,    // 大きさのばらつき（対数正規）
-    sizeMin   : 0.40,
-    sizeMax   : 2.30,
-    airFactor : 1.00,    // 抜けた液体の体積に対して昇る空気の体積
-    popTime   : 0.40,    // 液面で潰れるまでの時間（半径で伸びる）
-    fluidPush : 0.85,    // 粒子を押し出す強さ
-    minRise   : 0.004,   // これ以下の浮力しか得られない泡は止まる
+  // --- 流体（二相 3D Position Based Fluids: 液体＋空気） ---
+  //   相は質量だけが違う。浮力は与えない。上に乗った液体の重みが拘束を通じて伝わり、
+  //   軽い空気粒子だけが大きく押し退けられる。その結果として浮き上がる。
+  sim: {
+    particles : 0,       // 目標粒子数。0 なら端末を見て決める
+    substeps  : 1,       // 1フレームあたりの物理ステップ
+    iters     : 5,       // 密度拘束の反復回数。
+                         // 閉じた容器では圧力が伝わるのに反復が要る
+    hFactor   : 2.0,     // 平滑化半径 = hFactor × 粒子間隔
+    cellCap   : 40,      // 1セルに入る粒子の上限
+
+    densityRatio : 11.0, // 液体/空気 の質量比。実際は800倍だが解が荒れるので抑える
+                         // （浮力は 1−1/比 なので、11倍でもすでに0.91）
+    fillTop   : 0.90,    // 上の部屋のどこまでを液体にするか
+
+    // 液体のりのような、重くはないがとても粘る液体を想定している。
+    // 重力は控えめにし、粘りは下の viscosity（粒子どうしの速度の均し）で作る。
+    gravity   : 0.55,
+    damping   : 0.40,    // 全体の減衰は補助。主役は viscosity
+    maxVel    : 0.45,
+
+    relax     : 0.012,   // CFM。λの分母に対する割合
+    sCorrK    : 0.015,   // 人工圧力。λの大きさに対する割合（同じ相どうしのみ）
+    sCorrN    : 4.0,
+    sCorrQ    : 0.22,
+
+    viscosity : 0.95,    // 同じ相どうしの XSPH。これがせん断粘性になる
+    viscCross : 0.30,    // 相をまたぐ XSPH。液体が泡の動きを抑える
+    viscIters : 2,       // 1ステップあたりの粘性の回数。多いほど粘る
+    cohesionLiq: 1.20,   // 液体の凝集。界面張力になり、泡を丸める。
+                         // 上げすぎると通路で栓になって交換が止まる（2.2で停止）
+    cohesionGas: 0.60,   // 空気の凝集
+    phaseRepel : 0.10,   // 相をまたぐ斥力（粒子間隔に対する比）。界面を混ざらせない
+
+    adhesion  : 0.25,    // 壁への付着（液体のみ）
+    wallFric  : 0.85,    // 壁に触れている液体の接線方向の減衰
+    wallFricGas: 0.20,   // 空気は壁を濡らさないので滑る
+    wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
+    radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
+    drawRadius: 1.05,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
   },
 };
-
 /* ==========================================================================
    SHAPES — 容器の形
    ------------------------------------------------------------------------
@@ -340,57 +353,102 @@ const CONFIG = {
    固体 = outer ∧ ¬cavity （自動導出）
    ========================================================================== */
 
-const SHAPES = {
+// 画面の比率から容器を作る。外形の半高を 1 とし、外形の半径を画面の比率に合わせるので、
+// 画面いっぱいが容器になる（スマホそのものがウーズチューブになる）。
+// 角は丸めない。アクリル樹脂を機械加工したときのように稜線を立たせる。
+const SHAPE_BUILDERS = {
 
-  // 実物のウーズチューブ。外形はまっすぐな円筒で、中央に穴の開いた仕切り板がある。
-  oozeTube: {
-    label : 'ウーズチューブ',
-    bound : { r: 0.255, h: 1.045 },      // 外形を包む円筒（レイマーチの打ち切り）
-    cavityBound : { r: 0.200, h: 0.971 },// 空洞を包む円筒（粒子の配置とグリッド）
-    plateHalf : 0.046,                   // 仕切り板の半分の厚み
-    orifice : { p: [0, 0, 0], r: 0.062 },
+  // 実物のウーズチューブ。外形はまっすぐな筒で、中央に穴の開いた仕切り板がある。
+  oozeTube(A, targetN){
+    const outerR = A;
+    const wall   = Math.max(0.016, outerR*0.072);
+    const R      = outerR - wall;                 // 空洞の半径
+    const H      = 1.0 - wall;                    // 空洞の半高
+    const K      = CONFIG.neck;
+    // 仮の体積から粒子間隔を見積もり、通路の寸法を決める
+    const s0     = Math.cbrt(Math.PI*R*R*2*H*0.9/Math.max(targetN, 1));
+    const holeR  = Math.max(R*K.holeRatio, s0*K.minCells);
+    const plate  = holeR*K.lenRatio;              // 通路の半分の長さ
+    const vol    = Math.PI*R*R*2*(H - plate);
+    const s      = Math.cbrt(vol/Math.max(targetN, 1));
 
-    outer : { op:'roundedCylinder', r:0.232, h:1.028, round:0.095 },
+    return {
+      label : 'ウーズチューブ',
+      bound : { r: outerR*1.03, h: 1.02 },        // レイマーチの打ち切り用
+      cavityBound : { r: R, h: H },
+      plateHalf   : plate,
+      orifice     : { p: [0, 0, 0], r: holeR },
+      spacing     : s,
 
-    cavity: { op:'sub', k:0.014,
-      a: { op:'roundedCylinder', r:0.199, h:0.970, round:0.072 },
-      b: { op:'plateWithHole', halfThick:0.046, holeR:0.062, taper:0.50, k:0.010 },
-    },
+      outer : { op:'roundedCylinder', r: outerR, h: 1.0, round: 0.004 },
+
+      cavity: { op:'sub', k: 0.005,
+        a: { op:'roundedCylinder', r: R, h: H, round: 0.004 },
+        b: { op:'plateWithHole', halfThick: plate, holeR: holeR, taper: K.taper, k: 0.005 },
+      },
+    };
   },
 
   // 仕組みの確認用（UIには出さない。?shape=hourglass で見られる）
-  hourglass: {
-    label : '砂時計型',
-    bound : { r: 0.42, h: 1.05 },
-    cavityBound : { r: 0.37, h: 0.965 },
-    plateHalf : 0.05,
-    orifice : { p: [0, 0, 0], r: 0.055 },
+  hourglass(A, targetN){
+    const k = A/0.46;                              // 画面の比率に合わせて太らせる
+    const prof = (pts) => pts.map(([y, r]) => [y, r*k]);
+    const R = 0.37*k, H = 0.965;
+    const vol = Math.PI*R*R*2*H*0.55;
+    const s   = Math.cbrt(vol/Math.max(targetN, 1));
+    return {
+      label : '砂時計型',
+      bound : { r: 0.42*k, h: 1.02 },
+      cavityBound : { r: R, h: H },
+      plateHalf   : 0.05,
+      orifice     : { p: [0, 0, 0], r: Math.max(0.055*k, s*2.8) },
+      spacing     : s,
 
-    outer : { op:'revolve', round:0.02, profile:[
-      [-1.000, 0.00], [-1.000, 0.38], [-0.985, 0.40], [-0.62, 0.40],
-      [-0.30, 0.30], [-0.06, 0.085], [ 0.00, 0.075], [ 0.06, 0.085],
-      [ 0.30, 0.30], [ 0.62, 0.40], [ 0.985, 0.40], [ 1.000, 0.38],
-      [ 1.000, 0.00],
-    ]},
+      outer : { op:'revolve', round:0.004, profile: prof([
+        [-1.000, 0.00], [-1.000, 0.38], [-0.985, 0.40], [-0.62, 0.40],
+        [-0.30, 0.30], [-0.06, 0.085], [ 0.00, 0.075], [ 0.06, 0.085],
+        [ 0.30, 0.30], [ 0.62, 0.40], [ 0.985, 0.40], [ 1.000, 0.38],
+        [ 1.000, 0.00],
+      ])},
 
-    cavity: { op:'revolve', round:0.02, profile:[
-      [-0.962, 0.00], [-0.962, 0.345], [-0.60, 0.360],
-      [-0.28, 0.265], [-0.05, 0.055], [ 0.00, 0.045], [ 0.05, 0.055],
-      [ 0.28, 0.265], [ 0.60, 0.360], [ 0.962, 0.345], [ 0.962, 0.00],
-    ]},
+      cavity: { op:'revolve', round:0.004, profile: prof([
+        [-0.962, 0.00], [-0.962, 0.345], [-0.60, 0.360],
+        [-0.28, 0.265], [-0.05, 0.055], [ 0.00, 0.045], [ 0.05, 0.055],
+        [ 0.28, 0.265], [ 0.60, 0.360], [ 0.962, 0.345], [ 0.962, 0.00],
+      ])},
+    };
   },
-
 };
 
-const SHAPE = SHAPES[CONFIG.shape] || SHAPES.oozeTube;
+// 画面の比率が分かってから作る。極端な比率にならないよう幅を制限する。
+let SHAPE = null;
+function buildShape(aspect){
+  const A = Math.min(CONFIG.view.maxTubeAspect, Math.max(0.16, aspect));
+  const b = SHAPE_BUILDERS[CONFIG.shape] || SHAPE_BUILDERS.oozeTube;
+  SHAPE = b(A, CONFIG.sim.particles);
+  SHAPE.aspect = A;
+  return SHAPE;
+}
 
-// 粒子数は端末に合わせて決める。?p=20000 で上書きできる。
+// 調整用: ?sim.cohesionLiq=0.6 のように、数値のパラメータをURLから上書きできる。
 (() => {
-  if (QS.has('p')) { CONFIG.sim.particles = Math.max(2000, Math.min(60000, +QS.get('p'))); return; }
+  for (const [k, v] of QS.entries()) {
+    const m = k.match(/^(sim|liquid|glass|view|env|neck)\.(\w+)$/);
+    if (!m) continue;
+    const obj = CONFIG[m[1]];
+    if (obj && typeof obj[m[2]] === 'number') obj[m[2]] = parseFloat(v);
+  }
+})();
+
+// 粒子数は端末に合わせて決める。?p=40000 で上書きできる。
+// 二相（液体＋空気）を空洞いっぱいに詰めるので、初版より多めに要る。
+(() => {
+  if (QS.has('p')) { CONFIG.sim.particles = Math.max(3000, Math.min(90000, +QS.get('p'))); return; }
   const coarse = matchMedia('(pointer: coarse)').matches;
   const cores  = navigator.hardwareConcurrency || 4;
-  CONFIG.sim.particles = coarse ? (cores >= 6 ? 20000 : 12000)
-                                : (cores >= 8 ? 24000 : 16000);
+  // ソルバが時間の大半を使うので、ここが実質の性能つまみ。
+  CONFIG.sim.particles = coarse ? (cores >= 6 ? 50000 : 26000)
+                                : (cores >= 8 ? 56000 : 34000);
 })();
 
 /* ==========================================================================
@@ -711,16 +769,16 @@ function latticeDensity(s, h){
   return d;
 }
 
+// 単純立方格子で詰める。層ごとにずらすと latticeDensity の基準と
+// 詰まり具合が合わなくなり、密度拘束が不活性になってしまう（圧力が立たない）。
 function latticeFill(s, R, y0, y1){
   const out = [];
   const n = Math.ceil(R/s) + 1;
-  let layer = 0;
-  for (let y = y0 + 0.5*s; y <= y1; y += s, layer++) {
-    const off = (layer & 1) ? 0.5*s : 0;
+  for (let y = y0 + 0.5*s; y <= y1; y += s) {
     for (let ix = -n; ix <= n; ix++) {
-      const x = ix*s + off;
+      const x = ix*s;
       for (let iz = -n; iz <= n; iz++) {
-        const z = iz*s + off;
+        const z = iz*s;
         if (x*x + z*z > R*R) continue;
         if (SD.cavity(x, y, z) > -0.55*s) continue;
         out.push(x, y, z);
@@ -730,17 +788,17 @@ function latticeFill(s, R, y0, y1){
   return out;
 }
 
+// 空洞全体を粒子で埋め、上の部屋を液体、残りを空気にする。
+// 液体を前半、空気を後半にまとめて並べるので、描画では firstInstance を
+// 変えるだけで相ごとに描ける。相は途中で変わらないので並べ替えも要らない。
 function seedParticles(target){
-  const cb   = SHAPE.cavityBound;
-  const yBot = SHAPE.orifice.p[1] + SHAPE.plateHalf;
-  const yTop = cb.h * 0.93;                 // 上にわずかな空気層を残す
+  const cb = SHAPE.cavityBound;
 
-  // 目標の粒子数になるよう格子間隔を2回だけ調整する
-  let s = Math.cbrt(Math.PI*cb.r*cb.r*(yTop - yBot)/Math.max(target, 1));
-  let pts = [], used = s;
+  // 目標の粒子数になるよう格子間隔を調整する
+  let s = SHAPE.spacing, pts = [], used = s;
   for (let pass = 0; pass < 5; pass++) {
     used = s;
-    pts = latticeFill(s, cb.r, yBot, yTop);
+    pts = latticeFill(s, cb.r, -cb.h, cb.h);
     const n = pts.length/3;
     if (n === 0) { s *= 0.6; continue; }
     const ratio = n/target;
@@ -749,16 +807,38 @@ function seedParticles(target){
   }
   s = used;
 
-  // わずかに揺らして格子の対称性を崩す
+  // 相を決める：穴より上を液体にし、上端には空気の層を残す
+  const yBot = SHAPE.orifice.p[1] + SHAPE.plateHalf;
+  const yTop = yBot + (cb.h - yBot)*CONFIG.sim.fillTop;
+
+  // 確認用: ?seed=bubble で、上の部屋の中ほどに空気の塊を置く。
+  // 浮力だけを切り分けて見られる。
+  const bub = QS.get('seed') === 'bubble';
+  const bc  = [0, (yBot + yTop)*0.5, 0];
+  const br  = cb.r*0.35;
+
+  const liq = [], gas = [];
   const N = pts.length/3;
-  const arr = new Float32Array(N*4);
   for (let i = 0; i < N; i++) {
-    arr[i*4+0] = pts[i*3+0] + (Math.random()-0.5)*s*0.08;
-    arr[i*4+1] = pts[i*3+1] + (Math.random()-0.5)*s*0.08;
-    arr[i*4+2] = pts[i*3+2] + (Math.random()-0.5)*s*0.08;
-    arr[i*4+3] = 0;
+    const x = pts[i*3+0], y = pts[i*3+1], z = pts[i*3+2];
+    let isLiq = (y > yBot && y < yTop);
+    if (isLiq && bub) {
+      const dx = x - bc[0], dy = y - bc[1], dz = z - bc[2];
+      if (dx*dx + dy*dy + dz*dz < br*br) isLiq = false;
+    }
+    (isLiq ? liq : gas).push(i);
   }
-  return { positions: arr, count: N, spacing: s };
+
+  const order = liq.concat(gas);
+  const arr = new Float32Array(N*4);
+  for (let k = 0; k < N; k++) {
+    const i = order[k];
+    arr[k*4+0] = pts[i*3+0] + (Math.random()-0.5)*s*0.10;
+    arr[k*4+1] = pts[i*3+1] + (Math.random()-0.5)*s*0.10;
+    arr[k*4+2] = pts[i*3+2] + (Math.random()-0.5)*s*0.10;
+    arr[k*4+3] = k < liq.length ? 0 : 1;      // 参考用（シェーダは添字で判定する）
+  }
+  return { positions: arr, count: N, nLiquid: liq.length, spacing: s };
 }
 
 /* ==========================================================================
@@ -782,13 +862,13 @@ struct SP {
   grav  : vec4f,   // xyz = 重力加速度, w = dt
   grid  : vec4f,   // xyz = グリッド原点, w = セル幅
   dims  : vec4u,   // xyz = セル数, w = 粒子数
-  kern  : vec4f,   // x = h, y = poly6係数, z = spiky係数, w = 静止密度
+  kern  : vec4f,   // x = h, y = poly6係数, z = spiky係数, w = 格子の数密度
   solve : vec4f,   // x = relax, y = sCorrK, z = sCorrN, w = W(Δq)
-  visc  : vec4f,   // x = XSPH, y = 凝集, z = 付着, w = 壁摩擦
+  visc  : vec4f,   // x = 同相XSPH, y = 液体の凝集, z = 付着, w = 壁摩擦（液体）
   misc  : vec4f,   // x = 衝突半径, y = 最大速度, z = 壁バンド, w = 減衰
-  aux   : vec4f,   // x = ヒストグラムの範囲, y = ビン数, z = 泡の押し出し, w = 予備
+  phase : vec4f,   // x = 液体の粒子数, y = 空気の逆質量（密度比）, z = 相間斥力の距離, w = 空気の凝集
+  aux   : vec4f,   // x = 相間XSPH, y = 壁摩擦（空気）, z = 相間斥力の強さ, w = 予備
 };
-struct Bubbles { n: vec4u, b: array<vec4f, 64> };   // xyz = 中心, w = 半径
 
 @group(0) @binding(0) var<uniform> S: SP;
 @group(0) @binding(1) var<storage, read_write> pos : array<vec4f>;
@@ -798,14 +878,18 @@ struct Bubbles { n: vec4u, b: array<vec4f, 64> };   // xyz = 中心, w = 半径
 @group(0) @binding(5) var<storage, read_write> lam : array<f32>;
 @group(0) @binding(6) var<storage, read_write> cellCnt : array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> cellItm : array<u32>;
-@group(0) @binding(8) var<storage, read_write> hist    : array<atomic<u32>>;
-@group(0) @binding(9) var<uniform> BUB: Bubbles;
+@group(0) @binding(8) var<storage, read_write> stats   : array<atomic<u32>>;
 
 const CAP : u32 = ${cellCap}u;
 const PI  : f32 = 3.14159265359;
 
 ${SDF_LIB_WGSL}
 ${shapeSrc}
+
+// 相は添字で決まる（液体が前半、空気が後半。途中で変わらない）
+fn isGas(i: u32) -> bool { return f32(i) >= S.phase.x; }
+// 逆質量。空気は軽いので、同じ押し合いでも大きく動く。
+fn invMassOf(i: u32) -> f32 { return select(1.0, S.phase.y, isGas(i)); }
 
 fn gradCavity(p: vec3f) -> vec3f {
   let e = 0.0015;
@@ -826,21 +910,6 @@ fn confine(p: vec3f) -> vec3f {
   if (d < -r) { return p; }
   let n = gradCavity(p);
   return p - n*(d + r);
-}
-
-// 泡の中にいる粒子を外へ押し出す（昇る泡が液体を割って進む）
-fn pushBubbles(p: vec3f) -> vec3f {
-  var q = p;
-  let n = BUB.n.x;
-  for (var k = 0u; k < n; k++) {
-    let b = BUB.b[k];
-    let d = q - b.xyz;
-    let l2 = dot(d, d);
-    if (l2 >= b.w*b.w || l2 < 1e-12) { continue; }
-    let l = sqrt(l2);
-    q += (d/l)*((b.w - l)*S.aux.z);
-  }
-  return q;
 }
 
 fn poly6W(r2: f32) -> f32 {
@@ -882,12 +951,11 @@ fn csPredict(@builtin(global_invocation_id) gid: vec3u) {
   if (i >= S.dims.w) { return; }
   let dt = S.grav.w;
   var v = vel[i].xyz;
-  v += S.grav.xyz*dt;
+  v += S.grav.xyz*dt;                      // 重力は相によらず同じ加速度
   v *= max(0.0, 1.0 - S.misc.w*dt);
   let sp = length(v);
   if (sp > S.misc.y) { v *= S.misc.y/sp; }
-  var p = pos[i].xyz + v*dt;
-  p = confine(pushBubbles(p));
+  let p = confine(pos[i].xyz + v*dt);
   vel[i] = vec4f(v, 0.0);
   cur[i] = vec4f(p, 0.0);
 }
@@ -910,15 +978,22 @@ fn csBuild(@builtin(global_invocation_id) gid: vec3u) {
   if (slot < CAP) { cellItm[u32(ci)*CAP + slot] = i; }
 }
 
-/* ---------------- 密度拘束 ---------------- */
+/* ---------------- 密度拘束 ----------------
+   拘束は「粒子の詰まり具合（数密度 Σ W）」にかける。質量を混ぜないので、
+   液体の中に空気粒子が1個あっても無理な圧力が立たず、界面が安定する。
+
+   浮力は位置補正の重み付けから出る。補正量を逆質量で重み付けすると、
+   同じ圧力でも軽い空気は大きく動く。液体の圧力は深いほど高いので、
+   下から押される量が上から押される量を上回り、空気は昇る。
+   浮力を明示的に与えてはいない。                              */
 @compute @workgroup_size(64)
 fn csLambda(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= S.dims.w) { return; }
   let pi = cur[i].xyz;
-  let h  = S.kern.x;
-  let h2 = h*h;
-  let rho0 = S.kern.w;
+  let h2 = S.kern.x*S.kern.x;
+  let n0 = S.kern.w;            // 格子の数密度
+  let wi = invMassOf(i);
 
   var dens = 0.0;
   var gradI = vec3f(0.0);
@@ -938,15 +1013,15 @@ fn csLambda(@builtin(global_invocation_id) gid: vec3u) {
       if (r2 >= h2) { continue; }
       dens += poly6W(r2);
       if (j == i) { continue; }
-      let g = spikyG(r, sqrt(max(r2, 1e-12)))/rho0;
+      let g = spikyG(r, sqrt(max(r2, 1e-12)))/n0;
       gradI += g;
-      gradSum += dot(g, g);
+      gradSum += invMassOf(j)*dot(g, g);
     }
   }}}
 
   // 圧縮側だけを解く。膨張側まで拘束すると自由表面が内へ引かれて玉になる。
-  let C = max(dens/rho0 - 1.0, 0.0);
-  lam[i] = -C/(dot(gradI, gradI) + gradSum + S.solve.x);
+  let C = max(dens/n0 - 1.0, 0.0);
+  lam[i] = -C/(wi*dot(gradI, gradI) + gradSum + S.solve.x);
 }
 
 @compute @workgroup_size(64)
@@ -957,6 +1032,10 @@ fn csDelta(@builtin(global_invocation_id) gid: vec3u) {
   let h  = S.kern.x;
   let h2 = h*h;
   let li = lam[i];
+  let gi = isGas(i);
+  let n0 = S.kern.w;
+  let wi = invMassOf(i);
+  let rep = S.phase.z;
   var dp = vec3f(0.0);
 
   let base = cellOf(pi);
@@ -973,17 +1052,24 @@ fn csDelta(@builtin(global_invocation_id) gid: vec3u) {
       let r2 = dot(r, r);
       if (r2 >= h2) { continue; }
       let d = sqrt(max(r2, 1e-12));
-      // 人工圧力：粒子が塊になるのを防ぐ
-      let sc = -S.solve.y*pow(poly6W(r2)/S.solve.w, S.solve.z);
-      dp += (li + lam[j] + sc)*spikyG(r, d);
+      let same = (gi == isGas(j));
+      // 人工圧力は同じ相どうしだけ。相をまたいで効かせると界面で引き合ってしまう。
+      var sc = 0.0;
+      if (same) { sc = -S.solve.y*pow(poly6W(r2)/S.solve.w, S.solve.z); }
+      dp += ((li + lam[j] + sc)/n0)*spikyG(r, d);
+      // 相をまたぐ斥力。界面が混ざってぼやけるのを防ぐ。
+      if (!same && d < rep) {
+        let q = 1.0 - d/rep;
+        dp += (S.aux.z*q*q/d)*r;
+      }
     }
   }}}
 
-  dp /= S.kern.w;
-  let lim = 0.35*h;
+  dp *= wi;                       // ここで浮力が生まれる
+  let lim = select(0.35, 0.50, gi)*h;
   let dl = length(dp);
   if (dl > lim) { dp *= lim/dl; }
-  nxt[i] = vec4f(confine(pushBubbles(pi + dp)), 0.0);
+  nxt[i] = vec4f(confine(pi + dp), 0.0);
 }
 
 /* ---------------- 速度の確定 ---------------- */
@@ -1005,16 +1091,18 @@ fn csFinal(@builtin(global_invocation_id) gid: vec3u) {
   vel[i] = vec4f(v, 0.0);
 }
 
-/* ---------------- 粘性・凝集・壁への付着 ---------------- */
+/* ---------------- 粘性・凝集・壁 ----------------
+   粘りはここで作る。全体の減衰ではなく粒子どうしの速度の均し（XSPH）なので、
+   液が細く垂れるのも、泡がゆっくり昇るのも、同じ粘性から出てくる。   */
 @compute @workgroup_size(64)
 fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= S.dims.w) { return; }
   let pi = pos[i].xyz;
   let vi = vel[i].xyz;
-  let h  = S.kern.x;
-  let h2 = h*h;
+  let h2 = S.kern.x*S.kern.x;
   let dt = S.grav.w;
+  let gi = isGas(i);
 
   var dv = vec3f(0.0);
   var coh = vec3f(0.0);
@@ -1035,17 +1123,20 @@ fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
       if (r2 >= h2) { continue; }
       let d = sqrt(max(r2, 1e-12));
       let w = poly6W(r2);
-      dv += (vel[j].xyz - vi)*w;
+      let same = (gi == isGas(j));
+      let kv = select(S.aux.x, S.visc.x, same);
+      dv += (vel[j].xyz - vi)*(w*kv);
       wsum += w;
-      coh -= cohW(d)*(r/d);
+      // 凝集は同じ相どうしだけ。これが界面張力になり、泡を丸める。
+      if (same) { coh -= cohW(d)*(r/d); }
     }
   }}}
 
   var v = vi;
-  if (wsum > 1e-8) { v += S.visc.x*dv/wsum; }     // XSPH 粘性
-  v += S.visc.y*coh*dt;                            // 凝集（表面張力）
+  if (wsum > 1e-8) { v += dv/wsum; }
+  v += select(S.visc.y, S.phase.w, gi)*coh*dt;
 
-  // 壁への付着：接線方向を落として壁へ引き寄せる
+  // 壁。付着するのは液体だけで、空気は壁を濡らさないので滑る。
   let dw = sdCavity(pi);
   let band = S.misc.z;
   if (dw > -band) {
@@ -1053,8 +1144,8 @@ fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
     let k = clamp((dw + band)/band, 0.0, 1.0);
     let vn = dot(v, n);
     let vt = v - n*vn;
-    v = n*vn + vt*(1.0 - S.visc.w*k);
-    v += n*(S.visc.z*k*dt);
+    v = n*vn + vt*(1.0 - select(S.visc.w, S.aux.y, gi)*k);
+    if (!gi) { v += n*(S.visc.z*k*dt); }
   }
 
   let sp = length(v);
@@ -1062,26 +1153,46 @@ fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
   nxt[i] = vec4f(v, 0.0);
 }
 
-/* ---------------- 重力軸に沿った分布（液面を知るため） ---------------- */
+/* ---------------- 交換量の計測（調整用） ---------------- */
 @compute @workgroup_size(64)
-fn csHistClear(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= u32(S.aux.y)) { return; }
-  atomicStore(&hist[gid.x], 0u);
+fn csStatsClear(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= 4u) { return; }
+  atomicStore(&stats[gid.x], 0u);
 }
 
 @compute @workgroup_size(64)
-fn csHist(@builtin(global_invocation_id) gid: vec3u) {
+fn csStats(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= S.dims.w) { return; }
   let g = S.grav.xyz;
   let gl = length(g);
   if (gl < 1e-9) { return; }
-  let up = -g/gl;
-  let L = dot(pos[i].xyz, up);
-  let E = S.aux.x;
-  let nb = S.aux.y;
-  let t = clamp((L + E)/(2.0*E), 0.0, 0.99999);
-  atomicAdd(&hist[u32(t*nb)], 1u);
+  let pi = pos[i].xyz;
+  let above = dot(pi, -g/gl) > 0.0;
+  if (isGas(i)) {
+    if (above) { atomicAdd(&stats[0], 1u); }     // 穴より上に来た空気
+  } else {
+    if (!above) { atomicAdd(&stats[1], 1u); }    // 穴より下に落ちた液体
+  }
+
+  // 実際の詰まり具合（静止状態なら 1.0）。拘束が効いているかの確認用。
+  let h2 = S.kern.x*S.kern.x;
+  var dens = 0.0;
+  let base = cellOf(pi);
+  for (var dz = -1; dz <= 1; dz++) {
+  for (var dy = -1; dy <= 1; dy++) {
+  for (var dx = -1; dx <= 1; dx++) {
+    let ci = cellIdx(base + vec3i(dx, dy, dz));
+    if (ci < 0) { continue; }
+    let cnt = min(atomicLoad(&cellCnt[u32(ci)]), CAP);
+    for (var k = 0u; k < cnt; k++) {
+      let r = pi - pos[cellItm[u32(ci)*CAP + k]].xyz;
+      let r2 = dot(r, r);
+      if (r2 < h2) { dens += poly6W(r2); }
+    }
+  }}}
+  let ratio = u32(clamp(dens/S.kern.w, 0.0, 9.0)*1000.0);
+  if (isGas(i)) { atomicMax(&stats[2], ratio); atomicAdd(&stats[3], ratio/100u); }
 }
 
 @compute @workgroup_size(64)
@@ -1323,49 +1434,78 @@ fn floorCol(d: vec3f, near: vec3f, far: vec3f, shadow: f32) -> vec3f {
   return fl;
 }
 
+// --- 景色 ---
+//   容器が画面の大半を覆うので、見えているものはほぼ「容器ごしの環境マップ」になる。
+//   なめらかなグラデーションだけだと屈折させても変化が見えないので、
+//   輪郭の硬い光源・細い縦のストリップ・床と壁の境目を入れる。
+//   細いストリップは屈折すると線として曲がるので、液面や泡の形が一番よく分かる。
+
 fn envStudio(d: vec3f) -> vec3f {
-  let h = clamp(d.y*0.5 + 0.5, 0.0, 1.0);
-  var c = mix(vec3f(0.028, 0.031, 0.039), vec3f(0.088, 0.097, 0.118), smoothstep(0.34, 1.0, h));
-  if (d.y < -0.02) {
-    let fl = floorCol(d, vec3f(0.105, 0.110, 0.122), vec3f(0.020, 0.022, 0.029), 0.22);
-    c = mix(c, fl, smoothstep(-0.02, -0.13, d.y));
+  // 背景の壁（上へ向かって暗く）
+  var c = mix(vec3f(0.058, 0.065, 0.082), vec3f(0.014, 0.016, 0.022),
+              smoothstep(0.0, 0.8, d.y));
+
+  // 床。壁との境目ははっきり出す。
+  if (d.y < -0.004) {
+    let t = -1.12/d.y;
+    let p = d*t;
+    let r = length(p.xz);
+    var fl = mix(vec3f(0.125, 0.132, 0.148), vec3f(0.011, 0.013, 0.018),
+                 smoothstep(0.35, 4.2, r));
+    fl *= mix(0.10, 1.0, smoothstep(0.10, 0.90, r));      // 接地の影
+    c = mix(c, fl, smoothstep(-0.004, -0.018, d.y));      // 境目を硬く
   }
-  // キーライト（左上手前の大きなソフトボックス）
-  c += softbox(d, vec3f(-2.6,  3.1,  2.3), 1.95, 1.35, 0.17) * vec3f(12.0, 12.2, 12.8);
-  // フィル（右手前、縦長）
-  c += softbox(d, vec3f( 3.5,  0.8,  1.5), 0.85, 2.10, 0.26) * vec3f( 1.5,  1.6,  1.9);
-  // 背後の大きなパネル。液体を透かす光はここから来る
-  c += softbox(d, vec3f(-0.4,  0.9, -3.4), 3.00, 2.40, 0.55) * vec3f( 1.6,  1.7,  2.0);
+
+  c += softbox(d, vec3f(-2.3,  2.6,  2.0), 1.55, 1.15, 0.05) * vec3f(8.5, 8.6, 9.0);
+  c += softbox(d, vec3f( 2.9,  0.7,  1.9), 0.11, 1.70, 0.04) * vec3f(7.0, 7.2, 8.0);
+  c += softbox(d, vec3f( 2.2, -0.5, -2.2), 0.09, 1.30, 0.05) * vec3f(3.2, 3.3, 3.9);
+  c += softbox(d, vec3f(-2.6, -0.2, -1.6), 0.08, 1.10, 0.05) * vec3f(2.2, 2.3, 2.8);
+  c += softbox(d, vec3f(-0.4,  0.8, -3.2), 2.40, 2.00, 0.12) * vec3f(0.30, 0.32, 0.38);
   return c;
 }
 
 fn envRoom(d: vec3f) -> vec3f {
-  let h = clamp(d.y*0.5 + 0.5, 0.0, 1.0);
-  var c = mix(vec3f(0.055, 0.048, 0.040), vec3f(0.115, 0.104, 0.090), smoothstep(0.30, 1.0, h));
-  if (d.y < -0.02) {
-    let fl = floorCol(d, vec3f(0.150, 0.108, 0.072), vec3f(0.034, 0.025, 0.018), 0.20);
-    c = mix(c, fl, smoothstep(-0.02, -0.13, d.y));
+  var c = mix(vec3f(0.095, 0.086, 0.074), vec3f(0.022, 0.020, 0.018),
+              smoothstep(0.0, 0.8, d.y));
+  if (d.y < -0.004) {
+    let t = -1.12/d.y;
+    let p = d*t;
+    let r = length(p.xz);
+    var fl = mix(vec3f(0.165, 0.118, 0.078), vec3f(0.018, 0.013, 0.010),
+                 smoothstep(0.35, 4.2, r));
+    fl *= mix(0.10, 1.0, smoothstep(0.10, 0.90, r));
+    c = mix(c, fl, smoothstep(-0.004, -0.018, d.y));
   }
-  // 窓（昼光色、縦長）
-  c += softbox(d, vec3f(-3.0, 1.4, 1.1), 1.20, 1.85, 0.10) * vec3f(9.0, 9.8, 11.5);
-  // 室内灯（暖色、上）
-  c += softbox(d, vec3f( 0.6, 3.4, -0.8), 0.60, 0.60, 0.45) * vec3f(5.0, 3.9, 2.6);
+  // 窓（桟で3枚に割る。屈折すると縦線が曲がって見える）
+  c += softbox(d, vec3f(-2.9, 1.3, 1.9), 0.26, 1.55, 0.03) * vec3f(6.5, 7.0, 8.4);
+  c += softbox(d, vec3f(-2.9, 1.3, 0.1), 0.26, 1.55, 0.03) * vec3f(6.5, 7.0, 8.4);
+  // 室内灯（暖色）
+  c += softbox(d, vec3f( 0.8, 3.1, -0.6), 0.45, 0.45, 0.10) * vec3f(5.5, 4.2, 2.7);
+  c += softbox(d, vec3f( 2.6, 0.2, -1.8), 0.08, 1.00, 0.06) * vec3f(2.0, 1.7, 1.3);
   return c;
 }
 
 fn envSunset(d: vec3f) -> vec3f {
   let h = clamp(d.y, -1.0, 1.0);
-  var c = mix(vec3f(0.42, 0.20, 0.13), vec3f(0.045, 0.055, 0.115), smoothstep(-0.05, 0.75, h));
-  c = mix(c, vec3f(0.62, 0.33, 0.18), smoothstep(0.25, -0.02, abs(h)) * 0.8);
-  if (d.y < -0.02) {
-    let fl = floorCol(d, vec3f(0.100, 0.070, 0.055), vec3f(0.022, 0.018, 0.022), 0.25);
-    c = mix(c, fl, smoothstep(-0.02, -0.13, d.y));
+  var c = mix(vec3f(0.46, 0.21, 0.13), vec3f(0.035, 0.045, 0.100),
+              smoothstep(-0.02, 0.70, h));
+  // 水平線をはっきり出す
+  c = mix(c, vec3f(0.78, 0.40, 0.20), smoothstep(0.06, 0.0, abs(h))*0.85);
+  if (d.y < -0.004) {
+    let t = -1.12/d.y;
+    let p = d*t;
+    let r = length(p.xz);
+    var fl = mix(vec3f(0.115, 0.078, 0.058), vec3f(0.016, 0.013, 0.016),
+                 smoothstep(0.35, 4.2, r));
+    fl *= mix(0.12, 1.0, smoothstep(0.10, 0.90, r));
+    c = mix(c, fl, smoothstep(-0.004, -0.018, d.y));
   }
-  // 低い太陽
-  let sun = normalize(vec3f(-0.75, 0.085, 0.62));
+  // 低い太陽（輪郭を硬く）
+  let sun = normalize(vec3f(-0.72, 0.10, 0.68));
   let ca  = dot(d, sun);
-  c += vec3f(16.0, 7.4, 3.2) * smoothstep(0.9975, 0.9994, ca);
-  c += vec3f(0.95, 0.42, 0.20) * pow(max(ca, 0.0), 24.0) * 0.9;
+  c += vec3f(20.0, 9.0, 3.6) * smoothstep(0.9988, 0.9994, ca);
+  c += vec3f(0.85, 0.36, 0.16) * pow(max(ca, 0.0), 40.0);
+  c += softbox(d, vec3f( 2.6, 0.6, -1.9), 0.09, 1.20, 0.05) * vec3f(1.6, 1.2, 1.0);
   return c;
 }
 
@@ -1428,7 +1568,8 @@ ${WGSL_UNI}
 @group(0) @binding(2) var smp: sampler;
 @group(0) @binding(3) var liqDepth: texture_2d<f32>;
 @group(0) @binding(4) var liqThick: texture_2d<f32>;
-@group(0) @binding(5) var bubInfo : texture_2d<f32>;
+@group(0) @binding(5) var gasDepth: texture_2d<f32>;
+@group(0) @binding(6) var gasThick: texture_2d<f32>;
 
 const EPS   : f32 = ${f(M.eps)};
 const NEPS  : f32 = ${f(M.normalEps)};
@@ -1448,39 +1589,55 @@ ${shapeSrc}
 // 粒子を球として描いた深度（前面）と厚みから、液体を「深度方向のスラブ」とみなす。
 // 視線から少しずれたレイでも、投影しなおして同じ表を引けるので、
 // 屈折したレイの追跡をそのまま続けられる。
-fn liqAtUV(uv: vec2f) -> vec2f {         // x = 前面の深度, y = 厚み
-  let fv = vec2f(uv.x, 1.0 - uv.y);
-  let r  = U.res.xy;
-  let t  = vec2i(clamp(fv*r, vec2f(0.0), r - vec2f(1.0)));
-  // 厚みは半解像度で線形に読む。粒子ひとつぶんの段差がならされる。
-  return vec2f(textureLoad(liqDepth, t, 0).r,
-               textureSampleLevel(liqThick, smp, fv, 0.0).r);
-}
 fn projUV(p: vec3f) -> vec3f {           // xy = uv(y上), z = ビュー深度
   let c = U.viewProj*vec4f(p, 1.0);
   if (c.w <= 1e-6) { return vec3f(-1.0, -1.0, -1.0); }
   return vec3f(c.xy/c.w*0.5 + vec2f(0.5, 0.5), c.w);
 }
-// 画素ごとに手前の泡（中心と半径）
-fn bubAt(uv: vec2f) -> vec4f {
+fn texel(uv: vec2f) -> vec2i {
   let r = U.res.xy;
-  let t = vec2i(clamp(vec2f(uv.x, 1.0 - uv.y)*r, vec2f(0.0), r - vec2f(1.0)));
-  return textureLoad(bubInfo, t, 0);
+  return vec2i(clamp(vec2f(uv.x, 1.0 - uv.y)*r, vec2f(0.0), r - vec2f(1.0)));
 }
+// 相ごとの「前面の深度」と「厚み」。厚みは半解像度で線形に読むので段差が出ない。
+fn liqAtUV(uv: vec2f) -> vec2f {
+  return vec2f(textureLoad(liqDepth, texel(uv), 0).r,
+               textureSampleLevel(liqThick, smp, vec2f(uv.x, 1.0 - uv.y), 0.0).r);
+}
+fn gasAtUV(uv: vec2f) -> vec2f {
+  return vec2f(textureLoad(gasDepth, texel(uv), 0).r,
+               textureSampleLevel(gasThick, smp, vec2f(uv.x, 1.0 - uv.y), 0.0).r);
+}
+// 視線方向の距離なので、斜めの面で踏み越えないよう安全側に縮める
+fn slabDist(L: vec2f, z: f32) -> f32 {
+  if (L.x > U.fluid.w*0.5) { return 1.0; }
+  return max(L.x - z, z - (L.x + max(L.y, U.fluid.x*0.8)))*0.45;
+}
+
 fn viewPosAt(uv: vec2f, z: f32) -> vec3f {
   let ndc = uv*2.0 - vec2f(1.0, 1.0);
   return vec3f(ndc.x*U.camRight.w*U.camUp.w*z, ndc.y*U.camRight.w*z, -z);
 }
-// 深度の差分から液面の法線を起こす
-fn liqNormalW(p: vec3f) -> vec3f {
-  let q = projUV(p);
+fn toWorldN(n: vec3f) -> vec3f {
+  return normalize(U.camRight.xyz*n.x + U.camUp.xyz*n.y - U.camFwd.xyz*n.z);
+}
+// 深度の差分から面の法線を起こす。前後どちらか近いほうの差分を採って輪郭を保つ。
+fn normalFromDepth(q: vec3f, isGas: bool) -> vec3f {
   let e = U.res.zw;
-  let z   = liqAtUV(q.xy).x;
-  let zx1 = liqAtUV(q.xy + vec2f(e.x, 0.0)).x;
-  let zx0 = liqAtUV(q.xy - vec2f(e.x, 0.0)).x;
-  let zy1 = liqAtUV(q.xy + vec2f(0.0, e.y)).x;
-  let zy0 = liqAtUV(q.xy - vec2f(0.0, e.y)).x;
-  let P   = viewPosAt(q.xy, z);
+  var z   = 0.0; var zx1 = 0.0; var zx0 = 0.0; var zy1 = 0.0; var zy0 = 0.0;
+  if (isGas) {
+    z   = gasAtUV(q.xy).x;
+    zx1 = gasAtUV(q.xy + vec2f(e.x, 0.0)).x;
+    zx0 = gasAtUV(q.xy - vec2f(e.x, 0.0)).x;
+    zy1 = gasAtUV(q.xy + vec2f(0.0, e.y)).x;
+    zy0 = gasAtUV(q.xy - vec2f(0.0, e.y)).x;
+  } else {
+    z   = liqAtUV(q.xy).x;
+    zx1 = liqAtUV(q.xy + vec2f(e.x, 0.0)).x;
+    zx0 = liqAtUV(q.xy - vec2f(e.x, 0.0)).x;
+    zy1 = liqAtUV(q.xy + vec2f(0.0, e.y)).x;
+    zy0 = liqAtUV(q.xy - vec2f(0.0, e.y)).x;
+  }
+  let P  = viewPosAt(q.xy, z);
   var dx = viewPosAt(q.xy + vec2f(e.x, 0.0), zx1) - P;
   if (abs(zx0 - z) < abs(zx1 - z)) { dx = P - viewPosAt(q.xy - vec2f(e.x, 0.0), zx0); }
   var dy = viewPosAt(q.xy + vec2f(0.0, e.y), zy1) - P;
@@ -1490,12 +1647,12 @@ fn liqNormalW(p: vec3f) -> vec3f {
   if (l < 1e-12) { return -U.camFwd.xyz; }
   n = n/l;
   if (n.z < 0.0) { n = -n; }
-  return normalize(U.camRight.xyz*n.x + U.camUp.xyz*n.y - U.camFwd.xyz*n.z);
+  return toWorldN(n);
 }
 
-// x = 固体までの符号付き距離, y = 液体領域までの符号付き距離
-// body = 固体, liq = 液体（泡をくり抜いたもの）, bub = 泡, cav = 空洞, slab = 液体のスラブ
-struct FD { body: f32, liq: f32, bub: f32, cav: f32, slab: f32 };
+// body = 容器, liq = 液体（空気をくり抜いたもの）, cav = 空洞,
+// liqS = 液体のスラブ, gasS = 空気のスラブ
+struct FD { body: f32, liq: f32, cav: f32, liqS: f32, gasS: f32 };
 
 fn fields(p: vec3f) -> FD {
   var f: FD;
@@ -1503,25 +1660,20 @@ fn fields(p: vec3f) -> FD {
   let c = sdCavity(p);
   f.cav  = c;
   f.body = max(o, -c);
-  // 空洞の外に液体はないので、重い画面空間の判定を省く
-  if (c > 0.0) { f.slab = 1.0; f.bub = 1.0; f.liq = c; return f; }
+  // 空洞の外に中身はないので、重い画面空間の判定を省く
+  if (c > 0.0) { f.liqS = 1.0; f.gasS = 1.0; f.liq = c; return f; }
 
   let q = projUV(p);
-  var slab = 1.0;
-  var bub  = 1.0;
+  var liqS = 1.0;
+  var gasS = 1.0;
   if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
-    let L = liqAtUV(q.xy);
-    // 厚みが粒子1個ぶんしかないところは、はぐれ粒子なので液体とみなさない
-    if (L.x <= U.fluid.w*0.5 && L.y > U.fluid.x) {
-      // 視線方向の距離なので、斜めの面で踏み越えないよう安全側に縮める
-      slab = max(L.x - q.z, q.z - (L.x + L.y))*0.45;
-    }
-    let B = bubAt(q.xy);
-    if (B.w > 1e-5) { bub = length(p - B.xyz) - B.w; }
+    liqS = slabDist(liqAtUV(q.xy), q.z);
+    gasS = slabDist(gasAtUV(q.xy), q.z);
   }
-  f.slab = slab;
-  f.bub  = bub;
-  f.liq  = max(max(c, slab), -bub);
+  f.liqS = liqS;
+  f.gasS = gasS;
+  // 液体 = 空洞 ∩ 液体スラブ ∩ ¬空気スラブ
+  f.liq  = max(max(c, liqS), -gasS);
   return f;
 }
 fn ifaceDist(p: vec3f) -> f32 {
@@ -1616,6 +1768,21 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
 }
 
 @fragment fn fsMain(i: VO) -> @location(0) vec4f {
+  // 確認用: 相を色分けして見る（?view=phase）。屈折を通さないので物理だけを見られる。
+  if (U.camFwd.w > 0.5) {
+    let L = liqAtUV(i.uv);
+    let G = gasAtUV(i.uv);
+    // 厚みを足し合わせるので、液体の中にある泡も見える
+    var tl = select(0.0, min(L.y*1.9, 1.3), L.x < U.fluid.w*0.5);
+    var tg = select(0.0, min(G.y*1.9, 1.3), G.x < U.fluid.w*0.5);
+    if (U.camFwd.w > 2.5) { tg = 0.0; }        // 液相だけ
+    else if (U.camFwd.w > 1.5) { tl = 0.0; }   // 気相だけ
+    let c = vec3f(0.015, 0.018, 0.028)
+          + vec3f(0.07, 0.33, 0.95)*tl
+          + vec3f(1.00, 0.46, 0.06)*tg;
+    return vec4f(c, 1.0);
+  }
+
   let ndc = i.uv*2.0 - vec2f(1.0, 1.0);
   let rd0 = normalize(U.camFwd.xyz
           + U.camRight.xyz*(ndc.x*U.camRight.w*U.camUp.w)
@@ -1659,18 +1826,17 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
     pos = pos + dir*t;
 
     // --- 界面の法線（ガラス面か液面か、近いほうを採る） ---
+    // liq = max(cav, liqS, -gasS) のうち、どの面が効いているかで法線を選ぶ
     let f = fields(pos);
     var nrm: vec3f;
     if (abs(f.body) <= abs(f.liq)) {
-      nrm = gradBody(pos);
-    } else if (-f.bub >= f.cav && -f.bub >= f.slab) {
-      // 泡の面。球なので法線が正確に出せる
-      let B = bubAt(projUV(pos).xy);
-      nrm = normalize(pos - B.xyz);
-    } else if (f.cav >= f.slab) {
-      nrm = gradCav(pos);          // 液体が壁に接している面
+      nrm = gradBody(pos);                              // 容器の内壁
+    } else if (-f.gasS >= f.cav && -f.gasS >= f.liqS) {
+      nrm = normalFromDepth(projUV(pos), true);         // 泡の面
+    } else if (f.cav >= f.liqS) {
+      nrm = gradCav(pos);                               // 液体が壁に接している面
     } else {
-      nrm = liqNormalW(pos);       // 自由表面
+      nrm = normalFromDepth(projUV(pos), false);        // 液体の自由表面
     }
     if (dot(nrm, dir) > 0.0) { nrm = -nrm; }
 
@@ -1791,25 +1957,35 @@ struct DO { @location(0) d: f32, @builtin(frag_depth) z: f32 };
 const WGSL_SMOOTH = WGSL_COMMON + WGSL_UNI + `
 @group(0) @binding(1) var src: texture_2d<f32>;
 
+// narrow-range filter（Truong ら）
+//   中心の深度から一定の幅の外に出たサンプルは「捨てる」のではなく「端に丸める」。
+//   捨てると縁で重みが偏って輪郭が溶けるが、丸めると平均が端に寄るだけなので
+//   粒のでこぼこだけ消えて輪郭は立ったまま残る。
 fn smoothDir(fc: vec2f, dir: vec2i) -> f32 {
   let res = vec2i(U.res.xy);
   let t0  = vec2i(floor(fc));
   let z0  = textureLoad(src, t0, 0).r;
   if (z0 > U.fluid.w*0.5) { return z0; }
-  let R  = i32(U.fluid.z);
-  let sg = max(f32(R)*0.5, 1.0);
-  let sd = max(U.fluid.x*3.2, 1e-4);
+
+  let R   = i32(U.fluid.z);
+  let sg  = max(f32(R)*0.45, 1.0);
+  // 手前側は狭く、奥側は広く取る（手前の輪郭を鈍らせない）
+  let thr = max(U.fluid.x*4.2, 1e-4);
+  let lo  = z0 - thr*0.55;
+  let hi  = z0 + thr;
+
   var sum  = z0;
   var wsum = 1.0;
   for (var k = 1; k <= R; k++) {
+    let w = exp(-f32(k*k)/(2.0*sg*sg));
     for (var sgn = -1; sgn <= 1; sgn += 2) {
       let t = t0 + dir*(k*sgn);
-      if (t.x < 0 || t.y < 0 || t.x >= res.x || t.y >= res.y) { continue; }
-      let z = textureLoad(src, t, 0).r;
-      if (z > U.fluid.w*0.5) { continue; }
-      let dz = z - z0;
-      let w  = exp(-f32(k*k)/(2.0*sg*sg))*exp(-dz*dz/(2.0*sd*sd));
-      sum  += z*w;
+      var z = hi;                       // 画面外・液体なしは「奥」として扱う
+      if (t.x >= 0 && t.y >= 0 && t.x < res.x && t.y < res.y) {
+        let zs = textureLoad(src, t, 0).r;
+        if (zs <= U.fluid.w*0.5) { z = zs; }
+      }
+      sum  += clamp(z, lo, hi)*w;
       wsum += w;
     }
   }
@@ -1820,306 +1996,26 @@ fn smoothDir(fc: vec2f, dir: vec2i) -> f32 {
 @fragment fn fsSmoothY(i: VO) -> @location(0) f32 { return smoothDir(i.pos.xy, vec2i(0, 1)); }
 `;
 
-// --- 泡を球として描く（中心と半径をそのまま書き出す） ---
-//   泡は数十個しかないので、画素ごとに「手前にある泡の中心と半径」を残しておけば、
-//   合成のときに解析的な球として正確に屈折させられる。
-const WGSL_BUB = WGSL_COMMON + WGSL_UNI + `
-struct Bubbles { n: vec4u, b: array<vec4f, 64> };
-@group(0) @binding(1) var<uniform> BUB: Bubbles;
-
-struct BO {
-  @builtin(position) pos : vec4f,
-  @location(0)       uv  : vec2f,
-  @location(1)       vc  : vec3f,
-  @location(2) @interpolate(flat) info : vec4f,
-};
-
-@vertex fn vsBub(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> BO {
-  var Q = array<vec2f, 6>(
-    vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
-    vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0));
-  let q = Q[vi];
-  let b = BUB.b[ii];
-  let vc = (U.view*vec4f(b.xyz, 1.0)).xyz;
-  var o: BO;
-  o.pos  = U.proj*vec4f(vc + vec3f(q*b.w, 0.0), 1.0);
-  o.uv   = q;
-  o.vc   = vc;
-  o.info = b;
-  return o;
-}
-
-struct BFO { @location(0) info: vec4f, @builtin(frag_depth) z: f32 };
-
-@fragment fn fsBub(i: BO) -> BFO {
-  let d2 = dot(i.uv, i.uv);
-  if (d2 > 1.0 || i.info.w <= 0.0) { discard; }
-  let r  = i.info.w;
-  let vp = i.vc + vec3f(i.uv*r, sqrt(1.0 - d2)*r);
-  let c  = U.proj*vec4f(vp, 1.0);
-  var o: BFO;
-  o.info = i.info;
-  o.z    = c.z/c.w;
-  return o;
-}
-`;
-
 /* ==========================================================================
-   BUBBLES — 泡（CPU側）
-   ------------------------------------------------------------------------
-   泡をでたらめに湧かせるのではなく、「穴を抜けて下に落ちた液体と同じ体積の
-   空気が上に昇る」という収支で駆動する。これだけで、出るタイミングも
-   大きさも毎回変わり、流れが速いときほど泡が多く大きくなる。
-
-   ・浮力は沈み具合に比例、抗力はストークス型（終端速度が半径の2乗に比例）
-   ・泡ごとの乱数で横揺れするので、1個ずつ違う経路を通る
-   ・体積で重み付けして押し退けるので、大きい泡が小さい泡をどける
-   ・直上の泡の後流に入ると少し引かれ、連なって昇る
-   ・重なると確率で合体し、液面のそばではほぼ確実に合体する
-   ・液面に届くと、液を押しのけながら潰れて消える
-   ========================================================================== */
-
-function randn(){
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
-}
-
-const Bubbles = {
-  list: [],
-  airDebt: 0,
-  nextVol: 0,
-  surface: 1.0,      // 重力軸に沿った液面の高さ
-  upperN: 0,
-  prevUpperN: -1,
-  spawned: 0,
-  data: new Float32Array(4 + 64*4),   // GPU へ渡す（n, 中心と半径）
-
-  reset(){
-    this.list.length = 0;
-    this.airDebt = 0;
-    this.nextVol = this.randomVolume();
-    this.prevUpperN = -1;
-  },
-
-  randomRadius(){
-    const B = CONFIG.bubble;
-    const r0 = SHAPE.orifice.r;
-    const k = Math.exp(randn()*B.sizeSigma)*B.sizeMean;
-    return r0*Math.min(B.sizeMax, Math.max(B.sizeMin, k));
-  },
-  randomVolume(){
-    const r = this.randomRadius();
-    return (4/3)*Math.PI*r*r*r;
-  },
-
-  // ヒストグラムから液面の高さと上の部屋の粒子数を求める
-  readHistogram(hist, N, ext){
-    if (!hist || !N) return;
-    const nb = hist.length;
-    let cum = 0, surfBin = -1;
-    const thresh = Math.max(4, N*0.004);
-    for (let i = nb - 1; i >= 0; i--) {
-      cum += hist[i];
-      if (cum >= thresh) { surfBin = i; break; }
-    }
-    if (surfBin >= 0) {
-      const lvl = ((surfBin + 1)/nb)*2*ext - ext;
-      this.surface += (lvl - this.surface)*0.25;      // 読み戻しの揺れをならす
-    }
-    let upper = 0;
-    const mid = nb >> 1;
-    for (let i = mid; i < nb; i++) upper += hist[i];
-    this.upperN = upper;
-  },
-
-  update(dt, up, down, N, spacing){
-    const B = CONFIG.bubble;
-    const S = CONFIG.sim;
-    const t = performance.now()/1000;
-
-    // --- 下へ抜けた液体の体積ぶんだけ、空気の借りを積む ---
-    if (this.prevUpperN < 0) this.prevUpperN = this.upperN;
-    const left = this.prevUpperN - this.upperN;
-    this.prevUpperN = this.upperN;
-    if (left > 0) this.airDebt += left*spacing*spacing*spacing*B.airFactor;
-
-    // --- 借りが閾値を超えたら、その体積の泡を穴の上側に出す ---
-    const O = SHAPE.orifice.p;
-    while (this.airDebt >= this.nextVol && this.list.length < B.max) {
-      const vol = this.nextVol;
-      const r = Math.cbrt(vol*3/(4*Math.PI));
-      const a = Math.random()*Math.PI*2;
-      const rr = Math.sqrt(Math.random())*SHAPE.orifice.r*0.35;
-      this.list.push({
-        x: O[0] + Math.cos(a)*rr + up[0]*r*0.8,
-        y: O[1] + up[1]*r*0.8,
-        z: O[2] + Math.sin(a)*rr + up[2]*r*0.8,
-        vx: up[0]*0.03, vy: up[1]*0.03, vz: up[2]*0.03,
-        r, r0: r,
-        seed: Math.random(),
-        ph0: Math.random()*6.283, ph1: Math.random()*6.283,
-        pop: 0,
-      });
-      this.airDebt -= vol;
-      this.nextVol = this.randomVolume();
-      this.spawned++;
-    }
-    if (this.list.length >= B.max) this.airDebt = Math.min(this.airDebt, this.nextVol);
-
-    // --- 重力に垂直な2軸 ---
-    let e1 = [1, 0, 0];
-    if (Math.abs(up[0]) > 0.9) e1 = [0, 1, 0];
-    let ax = up[1]*e1[2] - up[2]*e1[1];
-    let ay = up[2]*e1[0] - up[0]*e1[2];
-    let az = up[0]*e1[1] - up[1]*e1[0];
-    const al = Math.hypot(ax, ay, az) || 1; ax/=al; ay/=al; az/=al;
-    const bx = up[1]*az - up[2]*ay;
-    const by = up[2]*ax - up[0]*az;
-    const bz = up[0]*ay - up[1]*ax;
-
-    const g    = S.gravity;
-    const grad = [0, 0, 0];
-    const L = this.list;
-
-    // --- 1個ずつの運動 ---
-    for (let i = L.length - 1; i >= 0; i--) {
-      const b = L[i];
-
-      // 潰れている途中
-      if (b.pop > 0) {
-        const T = B.popTime*(0.6 + b.r0/SHAPE.orifice.r*0.5);
-        b.pop += dt/T;
-        b.r = b.r0*Math.max(0, 1 - b.pop)**0.6;
-        if (b.pop >= 1 || b.r < b.r0*0.12) { L.splice(i, 1); continue; }
-      }
-
-      const lvl = b.x*up[0] + b.y*up[1] + b.z*up[2];
-      // 沈み具合（液面より下なら1、頭が出ると減る）
-      const sub = Math.min(1, Math.max(0, (this.surface - lvl + b.r)/(2*b.r)));
-
-      // 液面に届いたら潰れ始める
-      if (b.pop === 0 && sub < 0.55) { b.pop = 1e-4; }
-
-      // 浮力と重力
-      let axx = up[0]*g*B.buoy*sub;
-      let ayy = up[1]*g*B.buoy*sub;
-      let azz = up[2]*g*B.buoy*sub;
-
-      // 横揺れ（泡ごとに違う）
-      const w  = 0.5 + b.seed*1.6;
-      const s1 = Math.sin(t*w + b.ph0);
-      const s2 = Math.sin(t*w*0.77 + b.ph1);
-      const amp = B.wobble*g*sub;
-      axx += (ax*s1 + bx*s2)*amp;
-      ayy += (ay*s1 + by*s2)*amp;
-      azz += (az*s1 + bz*s2)*amp;
-
-      // 抗力（陰解法で安定に解く）。終端速度が半径の2乗に比例する。
-      const k = B.drag/Math.max(b.r*b.r, 1e-8);
-      const f = 1/(1 + k*dt);
-      b.vx = (b.vx + axx*dt)*f;
-      b.vy = (b.vy + ayy*dt)*f;
-      b.vz = (b.vz + azz*dt)*f;
-
-      b.x += b.vx*dt; b.y += b.vy*dt; b.z += b.vz*dt;
-
-      // 壁
-      const d = SD.cavity(b.x, b.y, b.z);
-      if (d > -b.r*0.75) {
-        SD.cavityGrad(b.x, b.y, b.z, grad);
-        const push = d + b.r*0.75;
-        b.x -= grad[0]*push; b.y -= grad[1]*push; b.z -= grad[2]*push;
-        const vn = b.vx*grad[0] + b.vy*grad[1] + b.vz*grad[2];
-        if (vn > 0) { b.vx -= grad[0]*vn; b.vy -= grad[1]*vn; b.vz -= grad[2]*vn; }
-      }
-      // 空洞から外れた泡は捨てる
-      if (!(d < 0.05)) { L.splice(i, 1); }
-    }
-
-    // --- 泡どうし：押し退け・後流・合体 ---
-    for (let i = 0; i < L.length; i++) {
-      const a2 = L[i];
-      for (let j = i + 1; j < L.length; j++) {
-        const b2 = L[j];
-        let dx = b2.x - a2.x, dy = b2.y - a2.y, dz = b2.z - a2.z;
-        let dist = Math.hypot(dx, dy, dz);
-        if (dist < 1e-9) { dist = 1e-9; dx = 1e-9; }
-        const sum = a2.r + b2.r;
-
-        if (dist < sum) {
-          const nx = dx/dist, ny = dy/dist, nz = dz/dist;
-          const ov = sum - dist;
-          const va = a2.r**3, vb = b2.r**3;
-          const wa = vb/(va + vb), wb = va/(va + vb);   // 体積が大きいほど動かない
-          const pk = ov*B.push;
-          a2.x -= nx*pk*wa; a2.y -= ny*pk*wa; a2.z -= nz*pk*wa;
-          b2.x += nx*pk*wb; b2.y += ny*pk*wb; b2.z += nz*pk*wb;
-
-          // 合体。液面のそばではほぼ確実に合体する。
-          const la = a2.x*up[0] + a2.y*up[1] + a2.z*up[2];
-          const nearSurf = (this.surface - la) < Math.max(a2.r, b2.r)*2.2;
-          const frac = ov/Math.min(a2.r, b2.r);
-          const prob = nearSurf ? 1.0 : 1 - Math.exp(-B.mergeRate*frac*dt);
-          if (Math.random() < prob) {
-            const v3 = va + vb;
-            const nr = Math.cbrt(v3);
-            a2.x = (a2.x*va + b2.x*vb)/v3;
-            a2.y = (a2.y*va + b2.y*vb)/v3;
-            a2.z = (a2.z*va + b2.z*vb)/v3;
-            a2.vx = (a2.vx*va + b2.vx*vb)/v3;
-            a2.vy = (a2.vy*va + b2.vy*vb)/v3;
-            a2.vz = (a2.vz*va + b2.vz*vb)/v3;
-            a2.r = nr; a2.r0 = Math.max(a2.r0, nr);
-            a2.pop = Math.max(a2.pop, b2.pop);
-            L.splice(j, 1); j--;
-            continue;
-          }
-        } else if (dist < sum*2.6) {
-          // 後流：上にいる泡に少し引かれる
-          const ahead = dx*up[0] + dy*up[1] + dz*up[2];
-          if (ahead > 0) {
-            const kk = B.draft*g*dt*(1 - dist/(sum*2.6))/dist;
-            a2.vx += dx*kk; a2.vy += dy*kk; a2.vz += dz*kk;
-          }
-        }
-      }
-    }
-
-    // --- GPU へ渡す配列を作る ---
-    const D = this.data;
-    const n = Math.min(L.length, B.max);
-    new Uint32Array(D.buffer, 0, 1)[0] = n;
-    for (let i = 0; i < n; i++) {
-      const b = L[i];
-      D[4 + i*4 + 0] = b.x;
-      D[4 + i*4 + 1] = b.y;
-      D[4 + i*4 + 2] = b.z;
-      D[4 + i*4 + 3] = b.r;
-    }
-    for (let i = n; i < B.max; i++) D[4 + i*4 + 3] = 0;
-    return n;
-  },
-};
-
-/* ==========================================================================
-   SIM — 流体ソルバ（WebGPU の計算シェーダ）
+   SIM — 二相流体ソルバ（WebGPU の計算シェーダ）
    ========================================================================== */
 
 const FAR = 1.0e5;
 
 const Sim = {
   ready: false,
-  N: 0, spacing: 0, h: 0, rho0: 1, cells: 0, dims: [0,0,0], origin: [0,0,0],
+  N: 0, nLiquid: 0, nGas: 0,
+  spacing: 0, h: 0, rho0: 1, cells: 0, dims: [0,0,0], origin: [0,0,0],
 
   init(dev){
     const C = CONFIG.sim;
     const seed = seedParticles(C.particles);
     this.N       = seed.count;
+    this.nLiquid = seed.nLiquid;
+    this.nGas    = seed.count - seed.nLiquid;
     this.spacing = seed.spacing;
     this.h       = C.hFactor*seed.spacing;
-    this.rho0    = latticeDensity(seed.spacing, this.h);
+    this.rho0    = latticeDensity(seed.spacing, this.h);   // 質量1のときの格子密度
 
     // 近傍グリッド（空洞を包む箱を1セルぶん広げる）
     const cb = SHAPE.cavityBound, cell = this.h;
@@ -2131,9 +2027,9 @@ const Sim = {
     ];
     this.cells = this.dims[0]*this.dims[1]*this.dims[2];
 
-    const mk = (size, extra = 0) => dev.createBuffer({
+    const mk = (size) => dev.createBuffer({
       size: Math.max(16, size),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | extra,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     this.bufPos = mk(this.N*16);
     this.bufVel = mk(this.N*16);
@@ -2142,21 +2038,14 @@ const Sim = {
     this.bufLam = mk(this.N*4);
     this.bufCnt = mk(this.cells*4);
     this.bufItm = mk(this.cells*C.cellCap*4);
-    this.bins    = C.histBins;
-    this.histExt = Math.hypot(cb.r, cb.h) + 0.05;
-    this.bufHist = dev.createBuffer({ size: this.bins*4,
+    this.bufStat = dev.createBuffer({ size: 16,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-    this.bufBub  = dev.createBuffer({ size: 16 + CONFIG.bubble.max*16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.ub     = dev.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-    // 読み戻し用（非同期。1〜2フレーム遅れるが、ゆっくりした泡には影響しない）
-    this.stage = [0, 1, 2].map(() => ({
-      buf: dev.createBuffer({ size: this.bins*4,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+    this.ub     = dev.createBuffer({ size: 144, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.stage = [0, 1].map(() => ({
+      buf: dev.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
       busy: false,
     }));
-    this.hist = new Uint32Array(this.bins);
+    this.stats = new Uint32Array(4);
 
     dev.queue.writeBuffer(this.bufPos, 0, seed.positions);
     dev.queue.writeBuffer(this.bufVel, 0, new Float32Array(this.N*4));
@@ -2165,11 +2054,9 @@ const Sim = {
     const st = GPUShaderStage.COMPUTE;
     const ent = [{ binding: 0, visibility: st, buffer: { type: 'uniform' } }];
     for (let b = 1; b <= 8; b++) ent.push({ binding: b, visibility: st, buffer: { type: 'storage' } });
-    ent.push({ binding: 9, visibility: st, buffer: { type: 'uniform' } });
     const bgl = dev.createBindGroupLayout({ entries: ent });
     const layout = dev.createPipelineLayout({ bindGroupLayouts: [bgl] });
     const mod = dev.createShaderModule({ code: buildSimWGSL(SHAPE, C.cellCap), label: 'sim' });
-    this.module = mod;
 
     const bg = (a, b) => dev.createBindGroup({ layout: bgl, entries: [
       { binding: 0, resource: { buffer: this.ub } },
@@ -2180,8 +2067,7 @@ const Sim = {
       { binding: 5, resource: { buffer: this.bufLam } },
       { binding: 6, resource: { buffer: this.bufCnt } },
       { binding: 7, resource: { buffer: this.bufItm } },
-      { binding: 8, resource: { buffer: this.bufHist } },
-      { binding: 9, resource: { buffer: this.bufBub } },
+      { binding: 8, resource: { buffer: this.bufStat } },
     ]});
     this.bg = [bg(this.bufCur, this.bufNxt), bg(this.bufNxt, this.bufCur)];
 
@@ -2197,18 +2083,18 @@ const Sim = {
       final   : pipe('csFinal'),
       visc    : pipe('csVisc'),
       applyV  : pipe('csApplyVel'),
-      histCl  : pipe('csHistClear'),
-      hist    : pipe('csHist'),
+      statCl  : pipe('csStatsClear'),
+      stat    : pipe('csStats'),
     };
 
-    this.spData = new Float32Array(32);
+    this.spData = new Float32Array(36);
     this.spU32  = new Uint32Array(this.spData.buffer);
     this.ready  = true;
   },
 
   writeParams(dev, dt, g){
     const C = CONFIG.sim, D = this.spData, Uu = this.spU32;
-    const h = this.h;
+    const h = this.h, s = this.spacing;
     const poly6C = 315/(64*Math.PI*Math.pow(h, 9));
     const spikyC = -45/(Math.PI*Math.pow(h, 6));
     const wq     = poly6(Math.pow(C.sCorrQ*h, 2), h);
@@ -2225,9 +2111,10 @@ const Sim = {
     Uu[8]=this.dims[0]; Uu[9]=this.dims[1]; Uu[10]=this.dims[2]; Uu[11]=this.N;
     D[12]=h; D[13]=poly6C; D[14]=spikyC; D[15]=this.rho0;
     D[16]=C.relax*denomR; D[17]=C.sCorrK/denomR; D[18]=C.sCorrN; D[19]=Math.max(wq, 1e-12);
-    D[20]=C.viscosity; D[21]=C.cohesion*cohR; D[22]=C.adhesion; D[23]=C.wallFric;
-    D[24]=C.radius*this.spacing; D[25]=C.maxVel; D[26]=C.wallBand*this.spacing; D[27]=C.damping;
-    D[28]=this.histExt; D[29]=this.bins; D[30]=CONFIG.bubble.fluidPush; D[31]=0;
+    D[20]=C.viscosity; D[21]=C.cohesionLiq*cohR; D[22]=C.adhesion; D[23]=C.wallFric;
+    D[24]=C.radius*s; D[25]=C.maxVel; D[26]=C.wallBand*s; D[27]=C.damping;
+    D[28]=this.nLiquid; D[29]=C.densityRatio; D[30]=C.phaseRepel*s; D[31]=C.cohesionGas*cohR;
+    D[32]=C.viscCross; D[33]=C.wallFricGas; D[34]=C.phaseRepel*s*0.9; D[35]=0;
     dev.queue.writeBuffer(this.ub, 0, D);
   },
 
@@ -2249,7 +2136,11 @@ const Sim = {
     for (let k = 0; k < sub; k++) {
       const pass = enc.beginComputePass();
       let a = 0;
-      const run = (pipe, n) => { pass.setPipeline(pipe); pass.setBindGroup(0, this.bg[a]); pass.dispatchWorkgroups(n); };
+      const run = (pipe, n) => {
+        pass.setPipeline(pipe);
+        pass.setBindGroup(0, this.bg[a]);
+        pass.dispatchWorkgroups(n);
+      };
 
       run(this.p.predict, wgP);
       run(this.p.clear,   wgC);
@@ -2259,39 +2150,37 @@ const Sim = {
         run(this.p.delta,  wgP);   // cur -> nxt
         a ^= 1;
       }
-      run(this.p.final,  wgP);
-      run(this.p.visc,   wgP);     // pos,vel -> nxt
-      run(this.p.applyV, wgP);
-      if (k === sub - 1) {
-        run(this.p.histCl, Math.ceil(this.bins/64));
-        run(this.p.hist,   wgP);
+      run(this.p.final, wgP);
+      for (let it = 0; it < C.viscIters; it++) {
+        run(this.p.visc,   wgP);   // pos,vel -> nxt
+        run(this.p.applyV, wgP);
+      }
+      if (DEBUG && k === sub - 1) {
+        run(this.p.statCl, 1);
+        run(this.p.stat,   wgP);
       }
       pass.end();
     }
   },
 
-  // 分布の読み戻し（コマンド投入時と、投入後の2段）
+  // 交換量の読み戻し（調整用。?debug=1 のときだけ）
   copyStats(enc){
-    if (!this.ready) return;
+    if (!this.ready || !DEBUG) return;
     const st = this.stage.find(x => !x.busy);
     if (!st) return;
     st.busy = true;
     this.pending = st;
-    enc.copyBufferToBuffer(this.bufHist, 0, st.buf, 0, this.bins*4);
+    enc.copyBufferToBuffer(this.bufStat, 0, st.buf, 0, 16);
   },
   mapStats(){
     const st = this.pending;
     if (!st) return;
     this.pending = null;
     st.buf.mapAsync(GPUMapMode.READ).then(() => {
-      this.hist.set(new Uint32Array(st.buf.getMappedRange()));
+      this.stats.set(new Uint32Array(st.buf.getMappedRange()));
       st.buf.unmap();
       st.busy = false;
     }).catch(() => { st.busy = false; });
-  },
-
-  writeBubbles(dev, data){
-    if (this.ready) dev.queue.writeBuffer(this.bufBub, 0, data);
   },
 
   // 粒子を初期状態に戻す
@@ -2301,7 +2190,6 @@ const Sim = {
     const n = Math.min(seed.count, this.N);
     dev.queue.writeBuffer(this.bufPos, 0, seed.positions, 0, n*4);
     dev.queue.writeBuffer(this.bufVel, 0, new Float32Array(this.N*4));
-    this.hist.fill(0);
   },
 };
 
@@ -2355,7 +2243,6 @@ const Gpu = {
       blur  : dev.createShaderModule({ code: WGSL_ENVBLUR, label: 'envblur' }),
       part  : dev.createShaderModule({ code: WGSL_PART,    label: 'part'    }),
       smooth: dev.createShaderModule({ code: WGSL_SMOOTH,  label: 'smooth'  }),
-      bub   : dev.createShaderModule({ code: WGSL_BUB,     label: 'bub'     }),
       main  : dev.createShaderModule({ code: buildMainWGSL(SHAPE), label: 'main' }),
       post  : dev.createShaderModule({ code: WGSL_POST,    label: 'post'    }),
     };
@@ -2386,11 +2273,6 @@ const Gpu = {
       vertex:{ module: mods.part, entryPoint:'vsPart' },
       fragment:{ module: mods.part, entryPoint:'fsPartThick', ...tgt('r16float', add) } });
 
-    this.pipeBub = dev.createRenderPipeline({ layout:'auto',
-      vertex:{ module: mods.bub, entryPoint:'vsBub' },
-      fragment:{ module: mods.bub, entryPoint:'fsBub', ...tgt('rgba32float') },
-      depthStencil:{ format:'depth32float', depthWriteEnabled:true, depthCompare:'less' } });
-
     this.pipeSmoothX = dev.createRenderPipeline({ layout:'auto',
       vertex:{ module: mods.smooth, entryPoint:'vsFull' },
       fragment:{ module: mods.smooth, entryPoint:'fsSmoothX', ...tgt('r32float') } });
@@ -2418,11 +2300,6 @@ const Gpu = {
       entries: [
         { binding:0, resource:{ buffer: this.ub } },
         { binding:1, resource:{ buffer: Sim.bufPos } },
-      ]});
-    this.bgBub = dev.createBindGroup({ layout: this.pipeBub.getBindGroupLayout(0),
-      entries: [
-        { binding:0, resource:{ buffer: this.ub } },
-        { binding:1, resource:{ buffer: Sim.bufBub } },
       ]});
 
     this.ok = true;
@@ -2480,49 +2357,55 @@ const Gpu = {
     if (w === this.w && h === this.h) return;
     this.w = w; this.h = h;
     const dev = this.dev;
-    for (const t of ['hdrTex','liqA','liqB','thickTex','depthTex','bubTex','bubDepth']) if (this[t]) this[t].destroy();
+    for (const t of ['hdrTex','liqA','liqB','gasA','gasB','thickLiq','thickGas','depthTex'])
+      if (this[t]) this[t].destroy();
 
     const mkTex = (format, usage) => dev.createTexture({ size:[w, h], format, usage });
     const RT = GPUTextureUsage.RENDER_ATTACHMENT, TB = GPUTextureUsage.TEXTURE_BINDING;
 
+    const half = (fmt) => dev.createTexture({
+      size:[Math.max(1, w >> 1), Math.max(1, h >> 1)], format: fmt, usage: RT | TB });
+
     this.hdrTex   = mkTex('rgba16float',  RT | TB);
-    this.liqA     = mkTex('r32float',     RT | TB);
-    this.liqB     = mkTex('r32float',     RT | TB);
-    this.thickTex = this.dev.createTexture({
-      size:[Math.max(1, w >> 1), Math.max(1, h >> 1)], format:'r16float', usage: RT | TB });
+    this.liqA     = mkTex('r32float',     RT | TB);   // 液体の前面の深度
+    this.liqB     = mkTex('r32float',     RT | TB);   // 平滑化の作業用
+    this.gasA     = mkTex('r32float',     RT | TB);   // 空気の前面の深度
+    this.gasB     = mkTex('r32float',     RT | TB);
+    this.thickLiq = half('r16float');
+    this.thickGas = half('r16float');
     this.depthTex = mkTex('depth32float', RT);
-    this.bubTex   = mkTex('rgba32float',  RT | TB);
-    this.bubDepth = mkTex('depth32float', RT);
 
     this.hdrView   = this.hdrTex.createView();
     this.liqAView  = this.liqA.createView();
     this.liqBView  = this.liqB.createView();
-    this.thickView = this.thickTex.createView();
+    this.gasAView  = this.gasA.createView();
+    this.gasBView  = this.gasB.createView();
+    this.thickLView= this.thickLiq.createView();
+    this.thickGView= this.thickGas.createView();
     this.depthView = this.depthTex.createView();
-    this.bubView   = this.bubTex.createView();
-    this.bubDView  = this.bubDepth.createView();
 
     this.bgMain = dev.createBindGroup({ layout: this.pipeMain.getBindGroupLayout(0), entries:[
       { binding:0, resource:{ buffer: this.ub } },
       { binding:1, resource: this.envView },
       { binding:2, resource: this.smp },
       { binding:3, resource: this.liqAView },
-      { binding:4, resource: this.thickView },
-      { binding:5, resource: this.bubView },
+      { binding:4, resource: this.thickLView },
+      { binding:5, resource: this.gasAView },
+      { binding:6, resource: this.thickGView },
     ]});
     this.bgPost = dev.createBindGroup({ layout: this.pipePost.getBindGroupLayout(0), entries:[
       { binding:0, resource:{ buffer: this.ub } },
       { binding:1, resource: this.hdrView },
       { binding:2, resource: this.smp },
     ]});
-    this.bgSmX = dev.createBindGroup({ layout: this.pipeSmoothX.getBindGroupLayout(0), entries:[
+    const smBG = (pipe, view) => dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries:[
       { binding:0, resource:{ buffer: this.ub } },
-      { binding:1, resource: this.liqAView },
+      { binding:1, resource: view },
     ]});
-    this.bgSmY = dev.createBindGroup({ layout: this.pipeSmoothY.getBindGroupLayout(0), entries:[
-      { binding:0, resource:{ buffer: this.ub } },
-      { binding:1, resource: this.liqBView },
-    ]});
+    this.bgSmLX = smBG(this.pipeSmoothX, this.liqAView);
+    this.bgSmLY = smBG(this.pipeSmoothY, this.liqBView);
+    this.bgSmGX = smBG(this.pipeSmoothX, this.gasAView);
+    this.bgSmGY = smBG(this.pipeSmoothY, this.gasBView);
   },
 
   render(dt, gravityDir){
@@ -2533,58 +2416,57 @@ const Gpu = {
     Sim.step(dev, enc, dt, gravityDir);
 
     const col = (view, clear) => ({ view, loadOp:'clear', storeOp:'store', clearValue: clear });
+    const FARC = { r:FAR, g:0, b:0, a:0 };
+    const ZERO = { r:0, g:0, b:0, a:0 };
 
-    // 2) 粒子を球として描いて液面の深度を取る
-    {
+    // 粒子を球として描いて、相ごとに前面の深度を取る
+    const depthPass = (view, first, count) => {
       const pass = enc.beginRenderPass({
-        colorAttachments:[col(this.liqAView, { r:FAR, g:0, b:0, a:0 })],
+        colorAttachments:[col(view, FARC)],
         depthStencilAttachment:{
           view: this.depthView, depthLoadOp:'clear', depthStoreOp:'store', depthClearValue:1.0,
         },
       });
-      pass.setPipeline(this.pipePartDepth);
-      pass.setBindGroup(0, this.bgPart);
-      pass.draw(6, Sim.N);
-      pass.end();
-    }
-    // 3) 深度を平滑化（横 -> 縦）
-    {
-      const pass = enc.beginRenderPass({ colorAttachments:[col(this.liqBView, { r:FAR, g:0, b:0, a:0 })] });
-      pass.setPipeline(this.pipeSmoothX); pass.setBindGroup(0, this.bgSmX); pass.draw(3); pass.end();
-    }
-    {
-      const pass = enc.beginRenderPass({ colorAttachments:[col(this.liqAView, { r:FAR, g:0, b:0, a:0 })] });
-      pass.setPipeline(this.pipeSmoothY); pass.setBindGroup(0, this.bgSmY); pass.draw(3); pass.end();
-    }
-    // 4) 厚み（吸収に使う）
-    {
-      const pass = enc.beginRenderPass({ colorAttachments:[col(this.thickView, { r:0, g:0, b:0, a:0 })] });
-      pass.setPipeline(this.pipePartThick);
-      pass.setBindGroup(0, this.bgPartThick);
-      pass.draw(6, Sim.N);
-      pass.end();
-    }
-    // 5) 泡（手前の泡の中心と半径を画素ごとに残す）
-    {
-      const pass = enc.beginRenderPass({
-        colorAttachments:[col(this.bubView, { r:0, g:0, b:0, a:0 })],
-        depthStencilAttachment:{
-          view: this.bubDView, depthLoadOp:'clear', depthStoreOp:'store', depthClearValue:1.0,
-        },
-      });
-      if (Bubbles.list.length > 0) {
-        pass.setPipeline(this.pipeBub);
-        pass.setBindGroup(0, this.bgBub);
-        pass.draw(6, Math.min(Bubbles.list.length, CONFIG.bubble.max));
+      if (count > 0) {
+        pass.setPipeline(this.pipePartDepth);
+        pass.setBindGroup(0, this.bgPart);
+        pass.draw(6, count, 0, first);
       }
       pass.end();
-    }
-    // 6) 本体
+    };
+    // 深度の平滑化（横 -> 縦）
+    const smoothPass = (dst, pipe, bg, clear) => {
+      const pass = enc.beginRenderPass({ colorAttachments:[col(dst, clear)] });
+      pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.draw(3); pass.end();
+    };
+    // 厚み（吸収と、スラブの奥行きに使う）
+    const thickPass = (view, first, count) => {
+      const pass = enc.beginRenderPass({ colorAttachments:[col(view, ZERO)] });
+      if (count > 0) {
+        pass.setPipeline(this.pipePartThick);
+        pass.setBindGroup(0, this.bgPartThick);
+        pass.draw(6, count, 0, first);
+      }
+      pass.end();
+    };
+
+    depthPass(this.liqAView, 0, Sim.nLiquid);
+    smoothPass(this.liqBView, this.pipeSmoothX, this.bgSmLX, FARC);
+    smoothPass(this.liqAView, this.pipeSmoothY, this.bgSmLY, FARC);
+
+    depthPass(this.gasAView, Sim.nLiquid, Sim.nGas);
+    smoothPass(this.gasBView, this.pipeSmoothX, this.bgSmGX, FARC);
+    smoothPass(this.gasAView, this.pipeSmoothY, this.bgSmGY, FARC);
+
+    thickPass(this.thickLView, 0, Sim.nLiquid);
+    thickPass(this.thickGView, Sim.nLiquid, Sim.nGas);
+
+    // 本体
     {
       const pass = enc.beginRenderPass({ colorAttachments:[col(this.hdrView, { r:0,g:0,b:0,a:1 })] });
       pass.setPipeline(this.pipeMain); pass.setBindGroup(0, this.bgMain); pass.draw(3); pass.end();
     }
-    // 7) トーンマップ
+    // トーンマップ
     {
       const pass = enc.beginRenderPass({
         colorAttachments:[col(this.ctx.getCurrentTexture().createView(), { r:0,g:0,b:0,a:1 })] });
@@ -2613,7 +2495,7 @@ function showError(msg, detail){
 
 // --- カメラ（固定。わずかに見下ろす） ---
 const CAM = (() => {
-  const el = 5.0*Math.PI/180, az = 0.0;
+  const el = 0.0, az = 0.0;
   const d  = CONFIG.view.camDist;
   const pos = [d*Math.cos(el)*Math.sin(az), d*Math.sin(el), d*Math.cos(el)*Math.cos(az)];
   const L = Math.hypot(...pos);
@@ -2631,21 +2513,22 @@ const CAM = (() => {
 let renderW = 0, renderH = 0, aspect = 1;
 
 // 描画の重さに合わせて解像度を上下させる。
-// レイマーチは画素数にそのまま比例するので、ここが一番効く。
+// 計算（ソルバ）が時間の大半を使うので、狙いは「30fps前後を保ちつつ
+// 余った分を解像度に回す」こと。60fpsを狙うと解像度が落ちすぎる。
 const Quality = {
-  scale: 1.0, min: 0.5, max: 1.0,
-  acc: 0, n: 0, hold: 1.2,
+  scale: 0.85, min: 0.45, max: 1.0,
+  target: 33, acc: 0, n: 0, hold: 1.2,
   update(dt, ms){
     this.acc += ms; this.n++;
     this.hold -= dt;
     if (this.n < 30 || this.hold > 0) return;
     const avg = this.acc/this.n;
     this.acc = 0; this.n = 0;
-    if (avg > 23 && this.scale > this.min) {
-      this.scale = Math.max(this.min, this.scale - 0.12);
+    if (avg > this.target + 4 && this.scale > this.min) {
+      this.scale = Math.max(this.min, this.scale - 0.10);
       this.hold = 1.5; resize();
-    } else if (avg < 13.5 && this.scale < this.max) {
-      this.scale = Math.min(this.max, this.scale + 0.06);
+    } else if (avg < this.target - 7 && this.scale < this.max) {
+      this.scale = Math.min(this.max, this.scale + 0.05);
       this.hold = 3.0; resize();
     }
   },
@@ -2701,7 +2584,8 @@ function writeUniforms(time){
 
   U[48]=R[0];  U[49]=R[1];  U[50]=R[2];  U[51]=CAM.tanHalf;
   U[52]=Up[0]; U[53]=Up[1]; U[54]=Up[2]; U[55]=aspect;
-  U[56]=F[0];  U[57]=F[1];  U[58]=F[2];  U[59]=0;
+  const VIEWS = { phase: 1, gas: 2, liq: 3 };
+  U[56]=F[0];  U[57]=F[1];  U[58]=F[2];  U[59]=VIEWS[QS.get('view')] || 0;
   U[60]=P[0];  U[61]=P[1];  U[62]=P[2];  U[63]=time;
   U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=0;
   U[68]=L.color[0]; U[69]=L.color[1]; U[70]=L.color[2]; U[71]=L.absorb;
@@ -2717,7 +2601,7 @@ function writeUniforms(time){
   const screenR = pr/(CONFIG.view.camDist*CAM.tanHalf)*(renderH*0.5);
   U[88]=pr;
   U[89]=3*s*s*s/(4*Math.PI*pr*pr*pr);
-  U[90]=Math.max(2, Math.min(18, Math.round(screenR*2.2)));
+  U[90]=Math.max(3, Math.min(18, Math.round(screenR*2.6)));
   U[91]=FAR;
 
   Gpu.dev.queue.writeBuffer(Gpu.ub, 0, U);
@@ -2734,9 +2618,6 @@ function frame(now){
   Quality.update(dt, dt*1000);
   resize();
   Gravity.update(dt);
-  Bubbles.readHistogram(Sim.hist, Sim.N, Sim.histExt);
-  Bubbles.update(Math.min(dt, 1/30), Gravity.up, Gravity.down, Sim.N, Sim.spacing);
-  Sim.writeBubbles(Gpu.dev, Bubbles.data);
   writeUniforms(now/1000);
   Gpu.render(Math.min(dt, 1/45), Gravity.down);
 
@@ -2751,8 +2632,9 @@ function frame(now){
         `描画 ${renderW}x${renderH}  品質 ${Quality.scale.toFixed(2)}\n` +
         `粒子 ${Sim.N}  間隔 ${Sim.spacing.toFixed(4)}  h ${Sim.h.toFixed(4)}\n` +
         `格子 ${Sim.dims.join('x')} = ${Sim.cells}  ρ0 ${Sim.rho0.toFixed(1)}\n` +
-        `泡 ${Bubbles.list.length}個  累計 ${Bubbles.spawned}  借り ${(Bubbles.airDebt*1e4).toFixed(2)}e-4\n` +
-        `液面 ${Bubbles.surface.toFixed(3)}  上の粒子 ${Bubbles.upperN}\n` +
+        `液体 ${Sim.nLiquid}  空気 ${Sim.nGas}\n` +
+        `上に来た空気 ${Sim.stats[0]}  下に落ちた液体 ${Sim.stats[1]}\n` +
+        `空気の詰まり 最大 ${(Sim.stats[2]/1000).toFixed(2)}  平均 ${(Sim.stats[3]*100/1000/Math.max(Sim.nGas,1)).toFixed(2)}\n` +
         `形状 ${CONFIG.shape}  環境 ${CONFIG.env.preset}\n` +
         `重力 ${g[0].toFixed(2)} ${g[1].toFixed(2)} ${g[2].toFixed(2)}\n` +
         `GPU ${Gpu.adapterInfo.vendor || '?'} / ${Gpu.adapterInfo.architecture || '?'}`;
@@ -2856,13 +2738,13 @@ const UI = (() => {
     // --- 初期値 ---
     applyColor(st.color || CONFIG.liquid.color);
     CONFIG.liquid.absorb   = st.absorb   ?? CONFIG.liquid.absorb;
-    CONFIG.bubble.airFactor= st.air      ?? CONFIG.bubble.airFactor;
+    CONFIG.sim.cohesionLiq = st.coh      ?? CONFIG.sim.cohesionLiq;
     setViscosity(st.visc ?? CONFIG.sim.damping);
     $('sAbs').value = CONFIG.liquid.absorb;
     $('vAbs').textContent = CONFIG.liquid.absorb.toFixed(1);
     $('sVis').value = CONFIG.sim.damping;
-    $('sBub').value = CONFIG.bubble.airFactor;
-    $('vBub').textContent = CONFIG.bubble.airFactor.toFixed(2);
+    $('sBub').value = CONFIG.sim.cohesionLiq;
+    $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
     if (st.env && ENV_PRESETS[st.env] !== undefined) CONFIG.env.preset = st.env;
     for (const b of $('segEnv').children) {
       b.setAttribute('aria-pressed', String(b.dataset.env === CONFIG.env.preset));
@@ -2886,15 +2768,15 @@ const UI = (() => {
     };
     $('sVis').oninput = (e) => { setViscosity(+e.target.value); st.visc = +e.target.value; save(); };
     $('sBub').oninput = (e) => {
-      CONFIG.bubble.airFactor = +e.target.value;
-      $('vBub').textContent = CONFIG.bubble.airFactor.toFixed(2);
-      st.air = CONFIG.bubble.airFactor; save();
+      CONFIG.sim.cohesionLiq = +e.target.value;
+      $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
+      st.coh = CONFIG.sim.cohesionLiq; save();
     };
 
     // --- ボタン ---
     gear.onclick    = () => toggle();
     $('bFlip').onclick  = () => Gravity.flip();
-    $('bReset').onclick = () => { Sim.reseed(Gpu.dev); Bubbles.reset(); };
+    $('bReset').onclick = () => Sim.reseed(Gpu.dev);
     $('bSensor').onclick = async () => {
       const ok = await Gravity.enableSensors();
       $('bSensor').textContent = ok ? '傾きを使っています' : '傾きを使えませんでした';
@@ -2933,9 +2815,9 @@ const UI = (() => {
   if (DEBUG) hud.hidden = false;
   try {
     resize();
+    buildShape(aspect);     // 画面の比率が分かってから容器を作る
     await Gpu.init(canvas);
     Gpu.resize(renderW, renderH);
-    Bubbles.reset();
     UI.init();
     addEventListener('resize', resize);
     requestAnimationFrame((t) => { lastT = t; frame(t); });
