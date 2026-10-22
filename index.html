@@ -302,7 +302,9 @@ const CONFIG = {
   //   通れなくなり、液体の塊と空気の塊が交互に通る（＝泡ができる）。
   neck: {
     lenRatio  : 0.16,   // 通路の長さ / 直径。実物の仕切りは薄い円板
-    holeRatio : 0.26,   // 通路の半径 / 空洞の半径。実物の見た目に合わせる
+    holeRatio : 0.31,   // 通路の半径 / 空洞の半径。実物の見た目に合わせる。
+                        // 粒子を細かくしても穴の実寸は保つこと。
+                        // 小さくすると流れが止まる
                         // 細くすると液体と空気がすれ違えず交換が止まる。
                         // この値は実測（交換量）で決めたもの。
     minCells  : 4.2,    // 通路の半径の下限（粒子間隔の倍数）。
@@ -351,7 +353,7 @@ const CONFIG = {
     wallFricGas: 0.20,   // 空気は壁を濡らさないので滑る
     wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
     radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
-    drawRadius: 1.15,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
+    drawRadius: 1.05,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
     renderFollow: 0.30,  // 描画用の位置がソルバに追従する割合（小さいほど揺れが減る）
     // 渦。実物では「細い紐が落ちているとき、ごくたまに揺れて回って見える」程度の
     // 微細な現象で、太い塊や容器全体が回るようなことは起こらない。
@@ -467,8 +469,10 @@ CONFIG_DEFAULTS = JSON.parse(JSON.stringify(CONFIG));
   const coarse = matchMedia('(pointer: coarse)').matches;
   const cores  = navigator.hardwareConcurrency || 4;
   // ソルバが時間の大半を使うので、ここが実質の性能つまみ。
-  CONFIG.sim.particles = coarse ? (cores >= 6 ? 50000 : 26000)
-                                : (cores >= 8 ? 56000 : 34000);
+  // 紐の太さは粒子数の3乗根でしか細くならない（8倍にして半分）。
+  // 20fps 前後を許容して、実測で回る上限に寄せてある。
+  CONFIG.sim.particles = coarse ? (cores >= 6 ? 110000 : 45000)
+                                : (cores >= 8 ? 120000 : 60000);
 })();
 
 /* ==========================================================================
@@ -2665,21 +2669,21 @@ const CAM = (() => {
 let renderW = 0, renderH = 0, aspect = 1;
 
 // 描画の重さに合わせて解像度を上下させる。
-// 計算（ソルバ）が時間の大半を使うので、狙いは「30fps前後を保ちつつ
-// 余った分を解像度に回す」こと。60fpsを狙うと解像度が落ちすぎる。
+// 計算（ソルバ）が時間の大半を使うので、狙いは「20fps前後を保ちつつ
+// 余った分を解像度に回す」こと。高いfpsを狙うと解像度が落ちすぎる。
 const Quality = {
-  scale: 0.85, min: 0.45, max: 1.0,
-  target: 33, acc: 0, n: 0, hold: 1.2,
+  scale: 0.85, min: 0.55, max: 1.0,
+  target: 46, acc: 0, n: 0, hold: 1.2,
   update(dt, ms){
     this.acc += ms; this.n++;
     this.hold -= dt;
     if (this.n < 30 || this.hold > 0) return;
     const avg = this.acc/this.n;
     this.acc = 0; this.n = 0;
-    if (avg > this.target + 4 && this.scale > this.min) {
+    if (avg > this.target + 6 && this.scale > this.min) {
       this.scale = Math.max(this.min, this.scale - 0.10);
       this.hold = 1.5; resize();
-    } else if (avg < this.target - 7 && this.scale < this.max) {
+    } else if (avg < this.target - 10 && this.scale < this.max) {
       this.scale = Math.min(this.max, this.scale + 0.05);
       this.hold = 3.0; resize();
     }
