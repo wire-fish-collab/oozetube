@@ -298,10 +298,10 @@ const CONFIG = {
   //   通れなくなり、液体の塊と空気の塊が交互に通る（＝泡ができる）。
   neck: {
     lenRatio  : 0.16,   // 通路の長さ / 直径。実物の仕切りは薄い円板
-    holeRatio : 0.34,   // 通路の半径 / 空洞の半径。実物の見た目に合わせる
+    holeRatio : 0.26,   // 通路の半径 / 空洞の半径。実物の見た目に合わせる
                         // 細くすると液体と空気がすれ違えず交換が止まる。
                         // この値は実測（交換量）で決めたもの。
-    minCells  : 5.0,    // 通路の半径の下限（粒子間隔の倍数）。
+    minCells  : 4.2,    // 通路の半径の下限（粒子間隔の倍数）。
                         // ここを割ると液体と空気がすれ違えなくなる
     offset    : 0.0,    // 仕切りの高さ（0が中央）
     taper     : 0.10,   // 出入口のひろがり
@@ -347,10 +347,10 @@ const CONFIG = {
     wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
     radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
     drawRadius: 1.25,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
-    swirl     : 0.55,    // 渦。穴に近いほど強い接線方向の力。
+    swirl     : 1.10,    // 渦。穴に近いほど強い接線方向の力。
                          // 実物で渦を巻いて落ちるのは自転ではなく流れの偏りによるが、
                          // 見え方としては同じなので、ここで作る
-    swirlWidth: 0.40,    // 渦が効く範囲（穴からの距離）
+    swirlWidth: 0.55,    // 渦が効く範囲（穴からの距離）
   },
 };
 /* ==========================================================================
@@ -1662,12 +1662,10 @@ fn gasAtUV(uv: vec2f) -> vec2f {
   return vec2f(textureLoad(gasDepth, texel(uv), 0).r,
                textureSampleLevel(gasThick, smp, vec2f(uv.x, 1.0 - uv.y), 0.0).r);
 }
-// 視線方向の距離なので、斜めの面で踏み越えないよう安全側に縮める
-fn slabDist(L: vec2f, z: f32) -> f32 {
-  if (L.x > U.fluid.w*0.5) { return 1.0; }
-  // 薄いところでも最低限の奥行きを持たせる。ここが薄すぎると
-  // 粒が見えたり消えたりして点滅する。
-  return max(L.x - z, z - (L.x + max(L.y, U.fluid.x*1.8)))*0.45;
+// 視線方向の距離なので、斜めの面で踏み越えないよう安全側に縮める。
+// zb を渡すことで、スラブの奥側を手前の相の手前で打ち切れる。
+fn slabDist(zf: f32, zb: f32, z: f32) -> f32 {
+  return max(zf - z, z - zb)*0.45;
 }
 
 fn viewPosAt(uv: vec2f, z: f32) -> vec3f {
@@ -1727,8 +1725,21 @@ fn fields(p: vec3f) -> FD {
   var liqS = 1.0;
   var gasS = 1.0;
   if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
-    liqS = slabDist(liqAtUV(q.xy), q.z);
-    gasS = slabDist(gasAtUV(q.xy), q.z);
+    let L = liqAtUV(q.xy);
+    let G = gasAtUV(q.xy);
+    let hasL = L.x < U.fluid.w*0.5;
+    let hasG = G.x < U.fluid.w*0.5;
+    // 薄いところでも最低限の奥行きを持たせる（薄すぎると点滅する）
+    let tmin = U.fluid.x*1.8;
+    if (hasL) { liqS = slabDist(L.x, L.x + max(L.y, tmin), q.z); }
+    if (hasG) {
+      var zb = G.x + max(G.y, tmin);
+      // 気体より奥から液体が始まるなら、気体はそこで終わる。
+      // ここを打ち切らないと、気体の中を落ちる細い筋が気体に覆い隠されて
+      // 見えなくなる（液体がワープして見える原因）。
+      if (hasL && L.x > G.x) { zb = min(zb, L.x); }
+      gasS = slabDist(G.x, zb, q.z);
+    }
   }
   f.liqS = liqS;
   f.gasS = gasS;
@@ -2047,12 +2058,13 @@ fn smoothDir(fc: vec2f, dir: vec2i) -> f32 {
     let w = exp(-f32(k*k)/(2.0*sg*sg));
     for (var sgn = -1; sgn <= 1; sgn += 2) {
       let t = t0 + dir*(k*sgn);
-      var z = hi;                       // 画面外・液体なしは「奥」として扱う
-      if (t.x >= 0 && t.y >= 0 && t.x < res.x && t.y < res.y) {
-        let zs = textureLoad(src, t, 0).r;
-        if (zs <= U.fluid.w*0.5) { z = zs; }
-      }
-      sum  += clamp(z, lo, hi)*w;
+      if (t.x < 0 || t.y < 0 || t.x >= res.x || t.y >= res.y) { continue; }
+      let zs = textureLoad(src, t, 0).r;
+      // 液体のない画素は「奥にある液体」ではないので、平均に入れてはいけない。
+      // 入れると、細い筋や縁がまとめて奥へ押しやられて消えてしまう
+      // （落ちる紐が見えない／壁ぎわに隙間ができる／面が震える、の原因）。
+      if (zs > U.fluid.w*0.5) { continue; }
+      sum  += clamp(zs, lo, hi)*w;
       wsum += w;
     }
   }
