@@ -318,8 +318,8 @@ const CONFIG = {
     hFactor   : 2.0,     // 平滑化半径 = hFactor × 粒子間隔
     cellCap   : 40,      // 1セルに入る粒子の上限
 
-    densityRatio : 11.0, // 液体/空気 の質量比。実際は800倍だが解が荒れるので抑える
-                         // （浮力は 1−1/比 なので、11倍でもすでに0.91）
+    densityRatio : 18.0, // 液体/空気 の質量比。実際は800倍だが解が荒れるので抑える
+                         // （浮力は 1−1/比 なので、18倍で0.94）
     fillTop   : 0.90,    // 上の部屋のどこまでを液体にするか
 
     // 液体のりのような、重くはないがとても粘る液体を想定している。
@@ -338,19 +338,21 @@ const CONFIG = {
     viscIters : 2,       // 1ステップあたりの粘性の回数。多いほど粘る
     cohesionLiq: 1.20,   // 液体の凝集。界面張力になり、泡を丸める。
                          // 上げすぎると通路で栓になって交換が止まる（2.2で停止）
-    cohesionGas: 0.60,   // 空気の凝集
+    cohesionGas: 0.22,   // 空気の凝集。強いと壁ぎわに貼りついて抜けなくなる
     phaseRepel : 0.10,   // 相をまたぐ斥力（粒子間隔に対する比）。界面を混ざらせない
 
-    adhesion  : 0.25,    // 壁への付着（液体のみ）
+    adhesion  : 0.10,    // 壁への付着（液体のみ）。強いと壁と液の間に空気を閉じ込める
     wallFric  : 0.85,    // 壁に触れている液体の接線方向の減衰
     wallFricGas: 0.20,   // 空気は壁を濡らさないので滑る
     wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
     radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
     drawRadius: 1.25,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
-    swirl     : 1.10,    // 渦。穴に近いほど強い接線方向の力。
-                         // 実物で渦を巻いて落ちるのは自転ではなく流れの偏りによるが、
-                         // 見え方としては同じなので、ここで作る
-    swirlWidth: 0.55,    // 渦が効く範囲（穴からの距離）
+    renderFollow: 0.30,  // 描画用の位置がソルバに追従する割合（小さいほど揺れが減る）
+    // 渦。実物では「細い紐が落ちているとき、ごくたまに揺れて回って見える」程度の
+    // 微細な現象で、太い塊や容器全体が回るようなことは起こらない。
+    // 細い紐は拘束が弱いので、ごく弱い力でも揺れが見える。
+    swirl     : 0.07,
+    swirlWidth: 0.30,    // 渦が効く範囲（穴からの距離）
   },
 };
 /* ==========================================================================
@@ -1131,6 +1133,7 @@ fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
   let h2 = S.kern.x*S.kern.x;
   let dt = S.grav.w;
   let gi = isGas(i);
+  let wi = invMassOf(i);
 
   var dv = vec3f(0.0);
   var coh = vec3f(0.0);
@@ -1152,7 +1155,11 @@ fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
       let d = sqrt(max(r2, 1e-12));
       let w = poly6W(r2);
       let same = (gi == isGas(j));
-      let kv = select(S.aux.x, S.visc.x, same);
+      // 運動量の受け渡しは質量比で効く。液体は空気より圧倒的に重いので、
+      // 空気に囲まれた液滴はほとんど減速しない（宙に浮かない）。
+      // 逆に空気は液体に強く引きずられる。
+      let ratio = wi/invMassOf(j);          // = 相手の質量 / 自分の質量
+      let kv = select(S.aux.x, S.visc.x, same)*min(ratio, 4.0);
       dv += (vel[j].xyz - vi)*(w*kv);
       wsum += w;
       // 凝集は同じ相どうしだけ。これが界面張力になり、泡を丸める。
@@ -2075,6 +2082,28 @@ fn smoothDir(fc: vec2f, dir: vec2i) -> f32 {
 @fragment fn fsSmoothY(i: VO) -> @location(0) f32 { return smoothDir(i.pos.xy, vec2i(0, 1)); }
 `;
 
+// --- 描画に使う位置を時間方向にならす ---
+//   ソルバの1ステップごとの細かい揺れがそのまま見えると、粒が振動して見える。
+//   描画用に少し遅れて追従する位置を別に持ち、そちらを描く。
+//   大きく飛んだとき（やり直し・反転の直後）は追従させる。
+const WGSL_RPOS = `
+struct RP { p: vec4f };          // x = 追従率, y = 粒子数, z = 追いつく距離
+@group(0) @binding(0) var<uniform> P: RP;
+@group(0) @binding(1) var<storage, read>       src: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4f>;
+
+@compute @workgroup_size(64)
+fn csRenderPos(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= u32(P.p.y)) { return; }
+  let a = src[i].xyz;
+  let b = dst[i].xyz;
+  let d = a - b;
+  let k = select(P.p.x, 1.0, dot(d, d) > P.p.z*P.p.z);
+  dst[i] = vec4f(b + d*k, 0.0);
+}
+`;
+
 /* ==========================================================================
    SIM — 二相流体ソルバ（WebGPU の計算シェーダ）
    ========================================================================== */
@@ -2117,6 +2146,7 @@ const Sim = {
     this.bufLam = mk(this.N*4);
     this.bufCnt = mk(this.cells*4);
     this.bufItm = mk(this.cells*C.cellCap*4);
+    this.bufRender = mk(this.N*16);        // 描画用（時間方向にならした位置）
     this.bufStat = dev.createBuffer({ size: 16,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     this.ub     = dev.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -2127,6 +2157,7 @@ const Sim = {
     this.stats = new Uint32Array(4);
 
     dev.queue.writeBuffer(this.bufPos, 0, seed.positions);
+    dev.queue.writeBuffer(this.bufRender, 0, seed.positions);
     dev.queue.writeBuffer(this.bufVel, 0, new Float32Array(this.N*4));
 
     // --- パイプライン ---
@@ -2165,6 +2196,25 @@ const Sim = {
       statCl  : pipe('csStatsClear'),
       stat    : pipe('csStats'),
     };
+
+    // 描画用の位置をならすパイプライン（必要なのは2本だけなので別レイアウト）
+    const rbgl = dev.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: st, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: st, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: st, buffer: { type: 'storage' } },
+    ]});
+    this.rub = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.pRender = dev.createComputePipeline({
+      layout: dev.createPipelineLayout({ bindGroupLayouts: [rbgl] }),
+      compute: { module: dev.createShaderModule({ code: WGSL_RPOS, label: 'rpos' }), entryPoint: 'csRenderPos' },
+    });
+    this.bgRender = dev.createBindGroup({ layout: rbgl, entries: [
+      { binding: 0, resource: { buffer: this.rub } },
+      { binding: 1, resource: { buffer: this.bufPos } },
+      { binding: 2, resource: { buffer: this.bufRender } },
+    ]});
+    dev.queue.writeBuffer(this.rub, 0, new Float32Array([
+      CONFIG.sim.renderFollow, this.N, this.spacing*6, 0]));
 
     this.spData = new Float32Array(44);
     this.spU32  = new Uint32Array(this.spData.buffer);
@@ -2243,6 +2293,13 @@ const Sim = {
       }
       pass.end();
     }
+
+    // 描画用の位置をならす
+    const rp = enc.beginComputePass();
+    rp.setPipeline(this.pRender);
+    rp.setBindGroup(0, this.bgRender);
+    rp.dispatchWorkgroups(wgP);
+    rp.end();
   },
 
   // 交換量の読み戻し（調整用。?debug=1 のときだけ）
@@ -2271,6 +2328,7 @@ const Sim = {
     const seed = seedParticles(CONFIG.sim.particles);
     const n = Math.min(seed.count, this.N);
     dev.queue.writeBuffer(this.bufPos, 0, seed.positions, 0, n*4);
+    dev.queue.writeBuffer(this.bufRender, 0, seed.positions, 0, n*4);
     dev.queue.writeBuffer(this.bufVel, 0, new Float32Array(this.N*4));
   },
 };
@@ -2376,12 +2434,12 @@ const Gpu = {
     this.bgPart = dev.createBindGroup({ layout: this.pipePartDepth.getBindGroupLayout(0),
       entries: [
         { binding:0, resource:{ buffer: this.ub } },
-        { binding:1, resource:{ buffer: Sim.bufPos } },
+        { binding:1, resource:{ buffer: Sim.bufRender } },
       ]});
     this.bgPartThick = dev.createBindGroup({ layout: this.pipePartThick.getBindGroupLayout(0),
       entries: [
         { binding:0, resource:{ buffer: this.ub } },
-        { binding:1, resource:{ buffer: Sim.bufPos } },
+        { binding:1, resource:{ buffer: Sim.bufRender } },
       ]});
 
     this.ok = true;
