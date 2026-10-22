@@ -194,7 +194,7 @@
 
   <div class="row">
     <label>粘り <b id="vVis"></b></label>
-    <input type="range" id="sVis" min="1.5" max="16" step="0.1">
+    <input type="range" id="sVis" min="0" max="1" step="0.01">
   </div>
 
   <div class="row">
@@ -216,6 +216,7 @@
     <button id="bReset">はじめから</button>
     <button id="bSensor" class="wide">スマホの傾きを使う</button>
     <button id="bInvert" class="wide">上下が逆のときはここ</button>
+    <button id="bDefault" class="wide">設定を既定に戻す</button>
   </div>
 </div>
 
@@ -239,6 +240,9 @@
 
 const QS    = new URLSearchParams(location.search);
 const DEBUG = QS.has('debug');
+
+// 「既定に戻す」で使う、手を加える前の値のひかえ。CONFIG を作った直後に取る。
+let CONFIG_DEFAULTS = null;
 
 const CONFIG = {
   // --- カメラと描画 ---
@@ -336,17 +340,18 @@ const CONFIG = {
     viscosity : 0.95,    // 同じ相どうしの XSPH。これがせん断粘性になる
     viscCross : 0.30,    // 相をまたぐ XSPH。液体が泡の動きを抑える
     viscIters : 2,       // 1ステップあたりの粘性の回数。多いほど粘る
-    cohesionLiq: 1.20,   // 液体の凝集。界面張力になり、泡を丸める。
+    cohesionLiq: 1.35,   // 液体の凝集。界面張力になり、液をまとめて細く引き伸ばす。
                          // 上げすぎると通路で栓になって交換が止まる（2.2で停止）
     cohesionGas: 0.22,   // 空気の凝集。強いと壁ぎわに貼りついて抜けなくなる
-    phaseRepel : 0.10,   // 相をまたぐ斥力（粒子間隔に対する比）。界面を混ざらせない
+    phaseRepel : 0.16,   // 相をまたぐ斥力（粒子間隔に対する比）。界面を混ざらせない。
+                         // 実物では空気と液体が混ざる動きは見えないので、強めに保つ
 
     adhesion  : 0.10,    // 壁への付着（液体のみ）。強いと壁と液の間に空気を閉じ込める
     wallFric  : 0.85,    // 壁に触れている液体の接線方向の減衰
     wallFricGas: 0.20,   // 空気は壁を濡らさないので滑る
     wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
     radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
-    drawRadius: 1.25,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
+    drawRadius: 1.15,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
     renderFollow: 0.30,  // 描画用の位置がソルバに追従する割合（小さいほど揺れが減る）
     // 渦。実物では「細い紐が落ちているとき、ごくたまに揺れて回って見える」程度の
     // 微細な現象で、太い塊や容器全体が回るようなことは起こらない。
@@ -442,6 +447,8 @@ function buildShape(aspect){
   SHAPE.aspect = A;
   return SHAPE;
 }
+
+CONFIG_DEFAULTS = JSON.parse(JSON.stringify(CONFIG));
 
 // 調整用: ?sim.cohesionLiq=0.6 のように、数値のパラメータをURLから上書きできる。
 (() => {
@@ -2850,11 +2857,19 @@ const UI = (() => {
       'linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)';
   }
 
+  // 粘りは 0〜1 のひとつのつまみで、本来の粘性（粒子どうしの速度の均し）と
+  // 全体の減衰をまとめて動かす。以前は減衰だけを動かしていて、
+  // 粘性のほうが主役なので変えてもほとんど効かなかった。
   function setViscosity(v){
-    CONFIG.sim.damping = v;
-    CONFIG.sim.maxVel  = Math.max(0.18, Math.min(1.2, 3.0/v));
-    $('vVis').textContent = v.toFixed(1);
+    const k = Math.max(0, Math.min(1, v));
+    CONFIG.sim.viscosity = 0.55 + 0.43*k;
+    CONFIG.sim.damping   = 0.08 + 1.4*k;
+    $('sVis').value = k;
+    $('vVis').textContent = k.toFixed(2);
   }
+  // 既定の粘り（CONFIG の初期値から逆算）
+  const viscFromConfig = (c) =>
+    Math.max(0, Math.min(1, (c.sim.viscosity - 0.55)/0.43));
 
   function dimSoon(){
     gear.classList.remove('dim');
@@ -2887,10 +2902,9 @@ const UI = (() => {
     applyColor(st.color || CONFIG.liquid.color);
     CONFIG.liquid.absorb   = st.absorb   ?? CONFIG.liquid.absorb;
     CONFIG.sim.cohesionLiq = st.coh      ?? CONFIG.sim.cohesionLiq;
-    setViscosity(st.visc ?? CONFIG.sim.damping);
+    setViscosity(st.visc ?? viscFromConfig(CONFIG_DEFAULTS));
     $('sAbs').value = CONFIG.liquid.absorb;
     $('vAbs').textContent = CONFIG.liquid.absorb.toFixed(1);
-    $('sVis').value = CONFIG.sim.damping;
     $('sBub').value = CONFIG.sim.cohesionLiq;
     $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
     if (st.env && ENV_PRESETS[st.env] !== undefined) CONFIG.env.preset = st.env;
@@ -2935,6 +2949,30 @@ const UI = (() => {
       Gravity.inverted = !Gravity.inverted;
       st.inv = Gravity.inverted; save();
       updInvert();
+    };
+
+    // 保存した設定をすべて捨てて、作り手が基準としている値に戻す
+    $('bDefault').onclick = () => {
+      const D = CONFIG_DEFAULTS;
+      CONFIG.liquid.color  = D.liquid.color.slice();
+      CONFIG.liquid.absorb = D.liquid.absorb;
+      CONFIG.sim.cohesionLiq = D.sim.cohesionLiq;
+      CONFIG.env.preset    = D.env.preset;
+      setViscosity(viscFromConfig(D));
+      applyColor(CONFIG.liquid.color);
+      $('sAbs').value = CONFIG.liquid.absorb;
+      $('vAbs').textContent = CONFIG.liquid.absorb.toFixed(1);
+      $('sBub').value = CONFIG.sim.cohesionLiq;
+      $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
+      for (const o of $('segEnv').children) {
+        o.setAttribute('aria-pressed', String(o.dataset.env === CONFIG.env.preset));
+      }
+      Gpu.buildEnv(CONFIG.env.preset);
+      Sim.reseed(Gpu.dev);
+      st = {}; save();
+      const b = $('bDefault');
+      b.textContent = '既定に戻しました';
+      setTimeout(() => { b.textContent = '設定を既定に戻す'; }, 2000);
     };
 
     $('bSensor').onclick = async () => {
