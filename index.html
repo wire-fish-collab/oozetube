@@ -240,6 +240,15 @@
 
 const QS    = new URLSearchParams(location.search);
 const DEBUG = QS.has('debug');
+const T0 = performance.now();
+const TSIM = { t: 0 };   // シミュレーション内の経過時間（fps に左右されない）
+// 紐の太さ（内径に対する％）。下の部屋の中ほどの断面積から出す。
+function threadPct(){
+  if (!SHAPE || !Sim.spacing) return 0;
+  const vol = Sim.stats[4]*Math.pow(Sim.spacing, 3);
+  const area = vol/0.15;                       // 輪切りの厚み
+  return 100*2*Math.sqrt(area/Math.PI)/(2*SHAPE.cavityBound.r);
+}
 
 // 「既定に戻す」で使う、手を加える前の値のひかえ。CONFIG を作った直後に取る。
 let CONFIG_DEFAULTS = null;
@@ -301,14 +310,14 @@ const CONFIG = {
   //   泡にならない。実物のように厚みのある通路にすると、どちらか一方しか
   //   通れなくなり、液体の塊と空気の塊が交互に通る（＝泡ができる）。
   neck: {
-    lenRatio  : 0.16,   // 通路の長さ / 直径。実物の仕切りは薄い円板
-    holeRatio : 0.31,   // 通路の半径 / 空洞の半径。実物の見た目に合わせる。
-                        // 粒子を細かくしても穴の実寸は保つこと。
-                        // 小さくすると流れが止まる
-                        // 細くすると液体と空気がすれ違えず交換が止まる。
-                        // この値は実測（交換量）で決めたもの。
-    minCells  : 4.2,    // 通路の半径の下限（粒子間隔の倍数）。
-                        // ここを割ると液体と空気がすれ違えなくなる
+    // ここが落ちる速さと紐の太さを決める。粘性ではない（下の注記を参照）。
+    lenRatio  : 1.0,    // 通路の長さ / 穴の半径。長いほど壁の摩擦が効いて流れが遅くなる。
+                        // 薄い円板（0.16）だと素通りして水のように落ちる
+    holeRatio : 0.13,   // 通路の半径 / 空洞の半径。実物の穴は内径の1割ほど。
+                        // 流量は穴の断面積に比例するので、ここが効き方として一番大きい。
+                        // 粒子を細かくしても穴の実寸は保つこと
+    minCells  : 2.2,    // 通路の半径の下限（粒子間隔の倍数）。
+                        // ここを割ると液体と空気がすれ違えず交換が止まる
     offset    : 0.0,    // 仕切りの高さ（0が中央）
     taper     : 0.10,   // 出入口のひろがり
   },
@@ -341,7 +350,8 @@ const CONFIG = {
 
     viscosity : 0.95,    // 同じ相どうしの XSPH。これがせん断粘性になる
     viscCross : 0.30,    // 相をまたぐ XSPH。液体が泡の動きを抑える
-    viscIters : 2,       // 1ステップあたりの粘性の回数。多いほど粘る
+    viscIters : 3,       // 1ステップあたりの粘性の回数。多いほど粘る。
+                         // 通路が細いときだけよく効く（太い穴ではほとんど効かない）
     cohesionLiq: 1.35,   // 液体の凝集。界面張力になり、液をまとめて細く引き伸ばす。
                          // 上げすぎると通路で栓になって交換が止まる（2.2で停止）
     cohesionGas: 0.22,   // 空気の凝集。強いと壁ぎわに貼りついて抜けなくなる
@@ -349,7 +359,8 @@ const CONFIG = {
                          // 実物では空気と液体が混ざる動きは見えないので、強めに保つ
 
     adhesion  : 0.10,    // 壁への付着（液体のみ）。強いと壁と液の間に空気を閉じ込める
-    wallFric  : 0.85,    // 壁に触れている液体の接線方向の減衰
+    wallFric  : 0.95,    // 壁に触れている液体の接線方向の減衰。
+                         // 細い通路では、これが流れを止める主な力になる
     wallFricGas: 0.20,   // 空気は壁を濡らさないので滑る
     wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
     radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
@@ -465,7 +476,7 @@ CONFIG_DEFAULTS = JSON.parse(JSON.stringify(CONFIG));
 // 粒子数は端末に合わせて決める。?p=40000 で上書きできる。
 // 二相（液体＋空気）を空洞いっぱいに詰めるので、初版より多めに要る。
 (() => {
-  if (QS.has('p')) { CONFIG.sim.particles = Math.max(3000, Math.min(90000, +QS.get('p'))); return; }
+  if (QS.has('p')) { CONFIG.sim.particles = Math.max(3000, Math.min(200000, +QS.get('p'))); return; }
   const coarse = matchMedia('(pointer: coarse)').matches;
   const cores  = navigator.hardwareConcurrency || 4;
   // ソルバが時間の大半を使うので、ここが実質の性能つまみ。
@@ -1202,7 +1213,7 @@ fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
 /* ---------------- 交換量の計測（調整用） ---------------- */
 @compute @workgroup_size(64)
 fn csStatsClear(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= 4u) { return; }
+  if (gid.x >= 8u) { return; }
   atomicStore(&stats[gid.x], 0u);
 }
 
@@ -1239,6 +1250,18 @@ fn csStats(@builtin(global_invocation_id) gid: vec3u) {
   }}}
   let ratio = u32(clamp(dens/S.kern.w, 0.0, 9.0)*1000.0);
   if (isGas(i)) { atomicMax(&stats[2], ratio); atomicAdd(&stats[3], ratio/100u); }
+
+  // 落ちていく紐の太さ。下の部屋の中ほどを薄く輪切りにして、
+  // 軸の近くにある液体の粒子を数える。体積から断面積が出る。
+  if (!isGas(i)) {
+    let up  = -g/gl;
+    let ax  = dot(pi, up);
+    if (ax > -0.55 && ax < -0.40) {
+      let rad = length(pi - up*ax);
+      if (rad < S.aux.w*0.55) { atomicAdd(&stats[4], 1u); }
+      atomicAdd(&stats[5], 1u);
+    }
+  }
 }
 
 @compute @workgroup_size(64)
@@ -2158,14 +2181,14 @@ const Sim = {
     this.bufCnt = mk(this.cells*4);
     this.bufItm = mk(this.cells*C.cellCap*4);
     this.bufRender = mk(this.N*16);        // 描画用（時間方向にならした位置）
-    this.bufStat = dev.createBuffer({ size: 16,
+    this.bufStat = dev.createBuffer({ size: 32,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     this.ub     = dev.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.stage = [0, 1].map(() => ({
-      buf: dev.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+      buf: dev.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
       busy: false,
     }));
-    this.stats = new Uint32Array(4);
+    this.stats = new Uint32Array(8);
 
     dev.queue.writeBuffer(this.bufPos, 0, seed.positions);
     dev.queue.writeBuffer(this.bufRender, 0, seed.positions);
@@ -2254,7 +2277,7 @@ const Sim = {
     D[20]=C.viscosity; D[21]=C.cohesionLiq*cohR; D[22]=C.adhesion; D[23]=C.wallFric;
     D[24]=C.radius*s; D[25]=C.maxVel; D[26]=C.wallBand*s; D[27]=C.damping;
     D[28]=this.nLiquid; D[29]=C.densityRatio; D[30]=C.phaseRepel*s; D[31]=C.cohesionGas*cohR;
-    D[32]=C.viscCross; D[33]=C.wallFricGas; D[34]=C.phaseRepel*s*0.9; D[35]=0;
+    D[32]=C.viscCross; D[33]=C.wallFricGas; D[34]=C.phaseRepel*s*0.9; D[35]=SHAPE.cavityBound.r;
     D[36]=C.swirl; D[37]=Math.max(C.swirlWidth, 1e-3); D[38]=0; D[39]=0;
     const O = SHAPE.orifice.p;
     D[40]=O[0]; D[41]=O[1]; D[42]=O[2]; D[43]=0;
@@ -2320,7 +2343,7 @@ const Sim = {
     if (!st) return;
     st.busy = true;
     this.pending = st;
-    enc.copyBufferToBuffer(this.bufStat, 0, st.buf, 0, 16);
+    enc.copyBufferToBuffer(this.bufStat, 0, st.buf, 0, 32);
   },
   mapStats(){
     const st = this.pending;
@@ -2778,7 +2801,9 @@ function frame(now){
   resize();
   Gravity.update(dt);
   writeUniforms(now/1000);
-  Gpu.render(Math.min(dt, 1/45), Gravity.down);
+  const dtSim = Math.min(dt, 1/45);
+  TSIM.t += dtSim;
+  Gpu.render(dtSim, Gravity.down);
 
   Perf.t += dt; Perf.n++;
   if (Perf.t >= 0.5) {
@@ -2794,6 +2819,7 @@ function frame(now){
         `液体 ${Sim.nLiquid}  空気 ${Sim.nGas}\n` +
         `上に来た空気 ${Sim.stats[0]}  下に落ちた液体 ${Sim.stats[1]}\n` +
         `空気の詰まり 最大 ${(Sim.stats[2]/1000).toFixed(2)}  平均 ${(Sim.stats[3]*100/1000/Math.max(Sim.nGas,1)).toFixed(2)}\n` +
+        `紐 ${threadPct().toFixed(1)}%  (${Sim.stats[4]}/${Sim.stats[5]})  落下率 ${(100*Sim.stats[1]/Math.max(Sim.nLiquid,1)).toFixed(1)}%  計算内 ${TSIM.t.toFixed(0)}s / 実時間 ${((now-T0)/1000).toFixed(0)}s\n` +
         `形状 ${CONFIG.shape}  環境 ${CONFIG.env.preset}\n` +
         `重力 ${g[0].toFixed(2)} ${g[1].toFixed(2)} ${g[2].toFixed(2)}\n` +
         `GPU ${Gpu.adapterInfo.vendor || '?'} / ${Gpu.adapterInfo.architecture || '?'}`;
@@ -2861,13 +2887,14 @@ const UI = (() => {
       'linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)';
   }
 
-  // 粘りは 0〜1 のひとつのつまみで、本来の粘性（粒子どうしの速度の均し）と
-  // 全体の減衰をまとめて動かす。以前は減衰だけを動かしていて、
-  // 粘性のほうが主役なので変えてもほとんど効かなかった。
+  // 粘りは 0〜1 のひとつのつまみで、粘性（粒子どうしの速度の均し）・その回数・
+  // 全体の減衰をまとめて動かす。回数まで動かすのは、1回ぶんの均しでは
+  // 粘りの上限が決まってしまうため。細い通路でだけよく効く。
   function setViscosity(v){
     const k = Math.max(0, Math.min(1, v));
     CONFIG.sim.viscosity = 0.55 + 0.43*k;
     CONFIG.sim.damping   = 0.08 + 1.4*k;
+    CONFIG.sim.viscIters = Math.min(5, Math.max(1, Math.round(1 + 2.2*k)));
     $('sVis').value = k;
     $('vVis').textContent = k.toFixed(2);
   }
