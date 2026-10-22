@@ -215,6 +215,7 @@
     <button id="bFlip">ひっくり返す</button>
     <button id="bReset">はじめから</button>
     <button id="bSensor" class="wide">スマホの傾きを使う</button>
+    <button id="bInvert" class="wide">上下が逆のときはここ</button>
   </div>
 </div>
 
@@ -296,15 +297,13 @@ const CONFIG = {
   //   泡にならない。実物のように厚みのある通路にすると、どちらか一方しか
   //   通れなくなり、液体の塊と空気の塊が交互に通る（＝泡ができる）。
   neck: {
-    lenRatio  : 0.50,   // 通路の長さ / 直径
-    holeRatio : 0.52,   // 通路の半径 / 空洞の半径
+    lenRatio  : 0.16,   // 通路の長さ / 直径。実物の仕切りは薄い円板
+    holeRatio : 0.34,   // 通路の半径 / 空洞の半径。実物の見た目に合わせる
                         // 細くすると液体と空気がすれ違えず交換が止まる。
                         // この値は実測（交換量）で決めたもの。
-    minCells  : 8.0,    // 通路の半径の下限（粒子間隔の倍数）。
-                        // ここを割ると液体と空気がすれ違えず交換が止まる。
-                        // 実測では 6.5 で停止、8.7 で安定して通った。
-    offset    : -0.28,  // 仕切りの高さ（0が中央）。下げると上の部屋が高くなり、
-                        // 空気の柱が切れるのに必要な長さを稼げる
+    minCells  : 5.0,    // 通路の半径の下限（粒子間隔の倍数）。
+                        // ここを割ると液体と空気がすれ違えなくなる
+    offset    : 0.0,    // 仕切りの高さ（0が中央）
     taper     : 0.10,   // 出入口のひろがり
   },
 
@@ -348,6 +347,10 @@ const CONFIG = {
     wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
     radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
     drawRadius: 1.25,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
+    swirl     : 0.55,    // 渦。穴に近いほど強い接線方向の力。
+                         // 実物で渦を巻いて落ちるのは自転ではなく流れの偏りによるが、
+                         // 見え方としては同じなので、ここで作る
+    swirlWidth: 0.40,    // 渦が効く範囲（穴からの距離）
   },
 };
 /* ==========================================================================
@@ -375,7 +378,7 @@ const SHAPE_BUILDERS = {
     const s0     = Math.cbrt(Math.PI*R*R*2*H*0.9/Math.max(targetN, 1));
     const holeR  = Math.max(R*K.holeRatio, s0*K.minCells);
     const plate  = holeR*K.lenRatio;              // 通路の半分の長さ
-    const oy     = Math.max(-H + plate*2.5, Math.min(H - plate*2.5, K.offset));
+    const oy     = Math.max(-H + plate*2.5, Math.min(H - plate*2.5, K.offset || 0));
     const vol    = Math.PI*R*R*(2*H - 2*plate);
     const s      = Math.cbrt(vol/Math.max(targetN, 1));
 
@@ -876,6 +879,8 @@ struct SP {
   misc  : vec4f,   // x = 衝突半径, y = 最大速度, z = 壁バンド, w = 減衰
   phase : vec4f,   // x = 液体の粒子数, y = 空気の逆質量（密度比）, z = 相間斥力の距離, w = 空気の凝集
   aux   : vec4f,   // x = 相間XSPH, y = 壁摩擦（空気）, z = 相間斥力の強さ, w = 予備
+  swirl : vec4f,   // x = 渦の強さ, y = 効く範囲, zw = 予備
+  orif  : vec4f,   // xyz = 穴の中心
 };
 
 @group(0) @binding(0) var<uniform> S: SP;
@@ -961,6 +966,21 @@ fn csPredict(@builtin(global_invocation_id) gid: vec3u) {
   var v = vel[i].xyz;
   v += S.grav.xyz*dt;                      // 重力は相によらず同じ加速度
   v *= max(0.0, 1.0 - S.misc.w*dt);
+  // 渦：穴に近いほど強い接線方向の力を加える。
+  // 実物で渦を巻いて落ちるのは地球の自転ではなく流れの偏りだが、見え方は同じ。
+  let gl = length(S.grav.xyz);
+  if (S.swirl.x > 0.0 && gl > 1e-9) {
+    let up  = -S.grav.xyz/gl;
+    let rel = pos[i].xyz - S.orif.xyz;
+    let ax  = dot(rel, up);
+    let rad = rel - up*ax;
+    let rl  = length(rad);
+    if (rl > 1e-5) {
+      let t = ax/S.swirl.y;
+      v += (cross(up, rad)/rl)*(S.swirl.x*gl*exp(-t*t)*dt);
+    }
+  }
+
   let sp = length(v);
   if (sp > S.misc.y) { v *= S.misc.y/sp; }
   let p = confine(pos[i].xyz + v*dt);
@@ -1241,50 +1261,74 @@ const Gravity = (() => {
   }
 
   /* ---------- センサー ---------- */
+  //
+  //   重力の向きは deviceorientation（beta / gamma）から出す。
+  //   devicemotion の accelerationIncludingGravity は iOS と Android で
+  //   符号の扱いが逆になることがあり、上下がひっくり返る。
+  //   deviceorientation は向きの定義が一つなので、その問題が起きない。
+  //   devicemotion は「振られたか」の判定にだけ使う。
 
-  function onMotion(e){
-    const a = e.accelerationIncludingGravity;
-    if (!a || (a.x == null && a.y == null && a.z == null)) return;
-    const ax = a.x || 0, ay = a.y || 0, az = a.z || 0;
+  let invert = false;            // 念のための手動反転
 
-    // 画面の向きに合わせて端末座標を回す（横持ちでも正しく効くように）
+  function onOrient(e){
+    if (e.beta == null || e.gamma == null) return;
+    const b = e.beta*Math.PI/180;
+    const g = e.gamma*Math.PI/180;
+
+    // 端末座標での重力（下向き）
+    //   平置き（画面が上）: beta=0, gamma=0 -> (0, 0, -1) 画面の奥へ
+    //   立てて持つ        : beta=90        -> (0, -1, 0) 画面の下へ
+    const cb = Math.cos(b);
+    let dx = -cb*Math.sin(g);
+    let dy = -Math.sin(b);
+    const dz = -cb*Math.cos(g);
+
+    // 画面の向きに合わせて回す（横持ちでも正しく効くように）
     const ang = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
     const r = -ang*Math.PI/180;
     const c = Math.cos(r), s2 = Math.sin(r);
-    const rx = ax*c - ay*s2;
-    const ry = ax*s2 + ay*c;
+    const rx = dx*c - dy*s2;
+    const ry = dx*s2 + dy*c;
 
-    // accelerationIncludingGravity は重力の逆向きなので、符号を返す
-    const L = Math.hypot(rx, ry, az) || 1;
-    gx = -rx/L; gy = -ry/L; gz = -az/L;
+    const k = invert ? -1 : 1;
+    const L = Math.hypot(rx, ry, dz) || 1;
+    gx = k*rx/L; gy = k*ry/L; gz = k*dz/L;
     sensorOn = true;
+  }
 
-    // 振られたかどうか：低周波成分との差
-    if (!haveLow) { lowA[0] = rx; lowA[1] = ry; lowA[2] = az; haveLow = true; }
+  function onMotion(e){
+    // 振られたかどうかだけを見る（重力の向きは onOrient が持つ）
+    const a = e.accelerationIncludingGravity;
+    if (!a) return;
+    const ax = a.x || 0, ay = a.y || 0, az = a.z || 0;
+    if (!haveLow) { lowA[0] = ax; lowA[1] = ay; lowA[2] = az; haveLow = true; }
     const k = 0.10;
-    lowA[0] += (rx - lowA[0])*k; lowA[1] += (ry - lowA[1])*k; lowA[2] += (az - lowA[2])*k;
-    const dx = rx - lowA[0], dy = ry - lowA[1], dz = az - lowA[2];
+    lowA[0] += (ax - lowA[0])*k; lowA[1] += (ay - lowA[1])*k; lowA[2] += (az - lowA[2])*k;
+    const dx = ax - lowA[0], dy = ay - lowA[1], dz = az - lowA[2];
     if (Math.hypot(dx, dy, dz) > 6.5) {
       jolt[0] += dx*0.05; jolt[1] += dy*0.05; jolt[2] += dz*0.05;
     }
   }
 
+  async function ask(Ev){
+    if (typeof Ev === 'undefined') return true;
+    if (typeof Ev.requestPermission !== 'function') return true;
+    try { return (await Ev.requestPermission()) === 'granted'; }
+    catch (_) { return false; }
+  }
+
   async function enableSensors(){
-    try {
-      if (typeof DeviceMotionEvent !== 'undefined' &&
-          typeof DeviceMotionEvent.requestPermission === 'function') {
-        const res = await DeviceMotionEvent.requestPermission();
-        if (res !== 'granted') return false;
-      }
-      addEventListener('devicemotion', onMotion);
-      return true;
-    } catch (_) {
-      return false;
-    }
+    const okO = await ask(typeof DeviceOrientationEvent !== 'undefined' ? DeviceOrientationEvent : undefined);
+    const okM = await ask(typeof DeviceMotionEvent      !== 'undefined' ? DeviceMotionEvent      : undefined);
+    if (okO) addEventListener('deviceorientation', onOrient);
+    if (okM) addEventListener('devicemotion', onMotion);
+    return okO;
   }
   const needsPermission = () =>
-    typeof DeviceMotionEvent !== 'undefined' &&
-    typeof DeviceMotionEvent.requestPermission === 'function';
+    (typeof DeviceOrientationEvent !== 'undefined' &&
+     typeof DeviceOrientationEvent.requestPermission === 'function') ||
+    (typeof DeviceMotionEvent !== 'undefined' &&
+     typeof DeviceMotionEvent.requestPermission === 'function');
 
   /* ---------- 代わりの操作（ドラッグ・キー） ---------- */
 
@@ -1349,6 +1393,8 @@ const Gravity = (() => {
 
   return {
     update, flip, enableSensors, needsPermission,
+    get inverted(){ return invert; },
+    set inverted(v){ invert = !!v; },
     get on(){ return sensorOn; },
     get down(){ return [sx, sy, sz]; },
     get up(){ return [-sx, -sy, -sz]; },
@@ -2061,7 +2107,7 @@ const Sim = {
     this.bufItm = mk(this.cells*C.cellCap*4);
     this.bufStat = dev.createBuffer({ size: 16,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-    this.ub     = dev.createBuffer({ size: 144, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.ub     = dev.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.stage = [0, 1].map(() => ({
       buf: dev.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
       busy: false,
@@ -2108,7 +2154,7 @@ const Sim = {
       stat    : pipe('csStats'),
     };
 
-    this.spData = new Float32Array(36);
+    this.spData = new Float32Array(44);
     this.spU32  = new Uint32Array(this.spData.buffer);
     this.ready  = true;
   },
@@ -2136,6 +2182,9 @@ const Sim = {
     D[24]=C.radius*s; D[25]=C.maxVel; D[26]=C.wallBand*s; D[27]=C.damping;
     D[28]=this.nLiquid; D[29]=C.densityRatio; D[30]=C.phaseRepel*s; D[31]=C.cohesionGas*cohR;
     D[32]=C.viscCross; D[33]=C.wallFricGas; D[34]=C.phaseRepel*s*0.9; D[35]=0;
+    D[36]=C.swirl; D[37]=Math.max(C.swirlWidth, 1e-3); D[38]=0; D[39]=0;
+    const O = SHAPE.orifice.p;
+    D[40]=O[0]; D[41]=O[1]; D[42]=O[2]; D[43]=0;
     dev.queue.writeBuffer(this.ub, 0, D);
   },
 
@@ -2806,6 +2855,18 @@ const UI = (() => {
     gear.onclick    = () => toggle();
     $('bFlip').onclick  = () => Gravity.flip();
     $('bReset').onclick = () => Sim.reseed(Gpu.dev);
+    // 端末によって傾きの向きが逆になることがあるので、手動で直せるようにする
+    Gravity.inverted = !!st.inv;
+    const updInvert = () => {
+      $('bInvert').textContent = Gravity.inverted ? '上下を元に戻す' : '上下が逆のときはここ';
+    };
+    updInvert();
+    $('bInvert').onclick = () => {
+      Gravity.inverted = !Gravity.inverted;
+      st.inv = Gravity.inverted; save();
+      updInvert();
+    };
+
     $('bSensor').onclick = async () => {
       const ok = await Gravity.enableSensors();
       $('bSensor').textContent = ok ? '傾きを使っています' : '傾きを使えませんでした';
