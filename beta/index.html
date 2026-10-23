@@ -1,0 +1,3967 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#07080c">
+<meta name="color-scheme" content="dark">
+<title>ウーズチューブ（試作）</title>
+
+<!--
+================================================================================
+  ウーズチューブ 3D流体シミュレータ  /  単一HTMLファイル
+================================================================================
+
+  粘度の高い液体が入った筒を、スマホの傾きセンサーに連動させて再現する。
+  液体は3Dの粒子法（Position Based Fluids）でGPU上で解き、
+  ガラスと液面は環境キューブマップを使った反射・屈折で描く。
+
+  --- 目次（この順にバナーコメントが並ぶ） ---
+    CONFIG      全パラメータ
+    SHAPES      容器の形（データとして記述）
+    SDFGEN      形データ -> WGSL / GLSL / JS の符号付き距離関数
+    GRAVITY     重力ベクトル（センサー・ドラッグ・キー）
+    WGSL        シェーダ本体
+    GPU         WebGPU バックエンド
+    APP         初期化・リサイズ・メインループ
+
+  --- 容器の形を増やすには ---
+    SHAPES に1エントリ追加するだけでよい。必要なのは次の3つ。
+      outer  : 固体の外形シルエット（プリミティブの木）
+      cavity : 内部の空洞。液体と空気が入る空間（プリミティブの木）
+      bound  : 外形を内包する円筒 {r, h}（レイマーチの打ち切りに使う）
+    固体（ガラス）は outer から cavity を引いて自動的に導かれるので、
+    仕切り板は「cavity に含めない」だけで表現できる。
+    使えるプリミティブは SDF_EMIT を参照。revolve は (y, 半径) の折れ線を
+    回転させるので、別のオイルタイマーの輪郭を数値の列で書くだけで試せる。
+    ?shape=名前 で切り替えられる。
+
+  --- デバッグ ---
+    ?debug=1   fps・解像度・各種情報を表示
+    ?shape=... 形を切り替え
+    ?env=...   環境マップのプリセット（studio / room / sunset）
+================================================================================
+-->
+
+<style>
+  :root{
+    --bg:#07080c;
+    --fg:#e8ecf2;
+    --dim:#8b93a3;
+  }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%;
+    overflow:hidden; background:var(--bg); color:var(--fg);
+    font:13px/1.6 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+    overscroll-behavior:none; touch-action:none;
+  }
+  #view{
+    display:block; position:fixed; inset:0;
+    width:100%; height:100%; background:var(--bg);
+  }
+  #hud{
+    position:fixed; left:0; top:0; z-index:50;
+    padding:calc(env(safe-area-inset-top) + 8px) 10px 8px 10px;
+    font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:var(--dim); white-space:pre; pointer-events:none;
+    text-shadow:0 1px 2px rgba(0,0,0,.8);
+  }
+  #hud[hidden]{ display:none; }
+  /* --- 操作パネル --- */
+  #gear{
+    position:fixed; z-index:60;
+    right:calc(env(safe-area-inset-right) + 14px);
+    bottom:calc(env(safe-area-inset-bottom) + 14px);
+    width:46px; height:46px; border:0; border-radius:23px;
+    background:rgba(28,32,40,.55); color:#cdd5e2;
+    backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+    display:grid; place-items:center; cursor:pointer;
+    opacity:.75; transition:opacity .5s ease, transform .18s ease;
+  }
+  #gear:active{ transform:scale(.93); }
+  #gear.dim{ opacity:.22; }
+  #gear svg{ width:21px; height:21px; fill:none; stroke:currentColor; stroke-width:1.6; }
+
+  #panel{
+    position:fixed; z-index:70; right:0; bottom:0;
+    width:min(340px, 100vw);
+    padding:16px 18px calc(env(safe-area-inset-bottom) + 18px);
+    background:rgba(16,19,26,.86);
+    backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+    border-top-left-radius:18px; border-top-right-radius:18px;
+    border-top:1px solid rgba(255,255,255,.07);
+    border-left:1px solid rgba(255,255,255,.07);
+    transform:translateY(102%); transition:transform .28s cubic-bezier(.3,.9,.3,1);
+    max-height:min(76vh, 560px); overflow-y:auto; overscroll-behavior:contain;
+  }
+  #panel.open{ transform:translateY(0); }
+  @media (max-width:520px){ #panel{ width:100vw; border-left:0; } }
+
+  #panel h2{ margin:0 0 14px; font-size:12px; font-weight:600; color:var(--dim); letter-spacing:.08em; }
+  #panel .row{ margin:0 0 15px; }
+  #panel label{ display:flex; justify-content:space-between; font-size:12px; color:var(--dim); margin-bottom:7px; }
+  #panel label b{ font-weight:500; color:#aeb7c6; font-variant-numeric:tabular-nums; }
+
+  .swatches{ display:grid; grid-template-columns:repeat(8, 1fr); gap:8px; }
+  .swatches button{
+    aspect-ratio:1; border-radius:50%; border:2px solid transparent;
+    cursor:pointer; padding:0; transition:transform .15s ease;
+  }
+  .swatches button[aria-pressed="true"]{ border-color:#fff; }
+  .swatches button:active{ transform:scale(.9); }
+
+  input[type=range]{
+    -webkit-appearance:none; appearance:none; width:100%; height:22px;
+    background:transparent; cursor:pointer;
+  }
+  input[type=range]::-webkit-slider-runnable-track{
+    height:3px; border-radius:2px; background:rgba(255,255,255,.17);
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none; width:17px; height:17px; border-radius:50%;
+    background:#e8ecf2; margin-top:-7px;
+  }
+  input[type=range]::-moz-range-track{ height:3px; border-radius:2px; background:rgba(255,255,255,.17); }
+  input[type=range]::-moz-range-thumb{ width:17px; height:17px; border:0; border-radius:50%; background:#e8ecf2; }
+
+  .btns{ display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+  .btns button, #boot button{
+    padding:11px 10px; border-radius:11px; border:1px solid rgba(255,255,255,.1);
+    background:rgba(255,255,255,.06); color:var(--fg); font-size:13px; cursor:pointer;
+  }
+  .btns button:active{ background:rgba(255,255,255,.13); }
+  .btns button.wide{ grid-column:1 / -1; }
+
+  .segs{ display:grid; grid-template-columns:repeat(3,1fr); gap:7px; }
+  .segs button{
+    padding:9px 4px; border-radius:10px; font-size:12px; cursor:pointer;
+    border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.04); color:var(--dim);
+  }
+  .segs button[aria-pressed="true"]{ background:rgba(255,255,255,.16); color:var(--fg); }
+
+  /* --- 起動オーバーレイ（センサーの許可） --- */
+  #boot{
+    position:fixed; inset:0; z-index:90; display:none;
+    place-content:center; text-align:center; padding:28px;
+    background:rgba(7,8,12,.92);
+  }
+  #boot.show{ display:grid; }
+  #boot p{ margin:0 0 20px; color:var(--dim); font-size:13px; line-height:1.9; }
+  #boot button{ min-width:190px; font-size:14px; padding:13px; }
+
+  #err{
+    position:fixed; inset:0; z-index:100; display:none;
+    place-content:center; padding:32px;
+    background:var(--bg); color:var(--fg);
+  }
+  #err.show{ display:grid; } 
+  #err{ grid-template-columns:minmax(0,1fr); }
+  #err .box{ max-width:min(34em, 100%); min-width:0; margin:0 auto; }
+  #err h1{ font-size:15px; font-weight:600; margin:0 0 12px; }
+  #err p{ margin:0 0 10px; color:var(--dim); }
+  #err pre{
+    margin:12px 0 0; padding:10px 12px; overflow:auto; max-height:40vh;
+    background:#11141b; border-radius:8px;
+    font:11px/1.5 ui-monospace,Menlo,monospace; color:#b9c2d0;
+  }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="hud" hidden></div>
+<button id="gear" aria-label="設定">
+  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v2.1M12 19.3v2.1M21.4 12h-2.1M4.7 12H2.6M18.6 5.4l-1.5 1.5M6.9 17.1l-1.5 1.5M18.6 18.6l-1.5-1.5M6.9 6.9L5.4 5.4"/></svg>
+</button>
+
+<div id="panel" role="dialog" aria-label="設定">
+  <h2>ウーズチューブ</h2>
+
+  <div class="row">
+    <label>液体の色</label>
+    <div class="swatches" id="swatches"></div>
+  </div>
+
+  <div class="row">
+    <label>色あい <b id="vHue"></b></label>
+    <input type="range" id="sHue" min="0" max="360" step="1">
+  </div>
+
+  <div class="row">
+    <label>濃さ <b id="vAbs"></b></label>
+    <input type="range" id="sAbs" min="0" max="20" step="0.1">
+  </div>
+
+  <div class="row">
+    <label>粘り <b id="vVis"></b></label>
+    <input type="range" id="sVis" min="0" max="1" step="0.01">
+  </div>
+
+  <div class="row">
+    <label>界面の張り <b id="vBub"></b></label>
+    <input type="range" id="sBub" min="0.2" max="4.0" step="0.05">
+  </div>
+
+  <div class="row">
+    <label>まわりの景色</label>
+    <div class="segs" id="segEnv">
+      <button data-env="studio">スタジオ</button>
+      <button data-env="room">室内</button>
+      <button data-env="sunset">夕景</button>
+    </div>
+  </div>
+
+  <div class="row btns">
+    <button id="bFlip">ひっくり返す</button>
+    <button id="bReset">はじめから</button>
+    <button id="bSensor" class="wide">スマホの傾きを使う</button>
+    <button id="bInvert" class="wide">上下が逆のときはここ</button>
+    <button id="bDefault" class="wide">設定を既定に戻す</button>
+  </div>
+</div>
+
+<div id="boot"><div>
+  <p>スマホを傾けたり、ひっくり返したりして<br>遊べます。<br>そのためにセンサーの利用を許可してください。</p>
+  <button id="bootOk">はじめる</button>
+</div></div>
+
+<div id="err"><div class="box">
+  <h1>この端末では動かせませんでした</h1>
+  <p id="errmsg"></p>
+  <pre id="errdetail"></pre>
+</div></div>
+
+<script>
+'use strict';
+
+/* ==========================================================================
+   CONFIG — 全パラメータ
+   ========================================================================== */
+
+const QS    = new URLSearchParams(location.search);
+const DEBUG = QS.has('debug');
+const T0 = performance.now();
+const TSIM = { t: 0 };   // シミュレーション内の経過時間（fps に左右されない）
+// 紐の太さ（内径に対する％）。下の部屋の中ほどの断面積から出す。
+function threadPct(){
+  if (!SHAPE || !Sim.spacing) return 0;
+  const vol = Sim.stats[4]*Math.pow(Sim.spacing, 3);
+  const area = vol/0.15;                       // 輪切りの厚み
+  return 100*2*Math.sqrt(area/Math.PI)/(2*SHAPE.cavityBound.r);
+}
+
+// 「既定に戻す」で使う、手を加える前の値のひかえ。CONFIG を作った直後に取る。
+let CONFIG_DEFAULTS = null;
+
+const CONFIG = {
+  // --- カメラと描画 ---
+  //   容器の外形の半高を 1 とし、画面の縦にそれがちょうど収まるようにする。
+  //   横幅は容器の半径が画面比率と一致するので、画面いっぱいが容器になる。
+  view: {
+    fitHalfHeight : 1.045,  // 画面の縦半分に収める world 単位の高さ（容器は 1.0）
+    camDist       : 7.5,    // カメラ距離。長めにして歪みを抑える
+    maxTubeAspect : 0.30,   // 容器の太さの上限（幅/高さ）。
+                            // 太いと空気の柱が切れる余地がなくなるので、
+                            // 画面が横に広くてもここまでに留める。
+    fluidScale    : 0.5,    // 流体の深度・厚みを描く解像度（画面に対する比）。
+                            // 下げると同じ手数で広い範囲を均せるので、粒の
+                            // 凹凸が消えてつながった液体に見える。
+    maxDpr        : 2,      // 解像度の上限（レイマーチが重いので抑える）
+    exposure      : 0.92,
+  },
+
+  // --- 容器（アクリル樹脂）---
+  glass: {
+    ior       : 1.49,                 // アクリル
+    absorb    : 0.22,                 // ほとんど無色
+    color     : [0.95, 0.98, 0.99],
+    roughness : 0.020,
+  },
+
+  // --- 液体 ---
+  liquid: {
+    ior    : 1.47,
+    color  : [0.90, 0.95, 0.98],  // この色が残る（= 補色が吸収される）
+    absorb : 3.0,                 // 既定はほぼ無色透明（うっすら色がつく程度）
+  },
+
+  // --- レイマーチの打ち切り ---
+  march: {
+    glassHit  : 72,     // ガラス前面を探す
+    inGlass   : 36,     // ガラスの中を抜ける
+    cavity    : 56,     // 空洞の中を進む（液面か背面ガラスまで）
+    inLiquid  : 64,     // 液体の中を抜ける
+    eps       : 0.0010,
+    normalEps : 0.0015,
+  },
+
+  // --- 環境マップ ---
+  env: {
+    preset   : QS.get('env') || 'studio',
+    faceSize : 256,
+    mipCount : 6,
+    bgGain   : 1.0,     // 直接見える背景の明るさ（照明用の環境マップとは別）
+  },
+
+  shape: QS.get('shape') || 'oozeTube',
+
+  // --- 仕切りの通路 ---
+  //   薄い板に空いた穴だと、液体と空気がすれ違って同時に通れてしまい、
+  //   泡にならない。実物のように厚みのある通路にすると、どちらか一方しか
+  //   通れなくなり、液体の塊と空気の塊が交互に通る（＝泡ができる）。
+  neck: {
+    // ここが落ちる速さと紐の太さを決める。粘性ではない（下の注記を参照）。
+    lenRatio  : 1.0,    // 通路の長さ / 穴の半径。長いほど壁の摩擦が効いて流れが遅くなる。
+                        // 薄い円板（0.16）だと素通りして水のように落ちる
+    holeRatio : 0.13,   // 通路の半径 / 空洞の半径。実物の穴は内径の1割ほど。
+                        // 流量は穴の断面積に比例するので、ここが効き方として一番大きい。
+                        // 粒子を細かくしても穴の実寸は保つこと
+    minCells  : 2.2,    // 通路の半径の下限（粒子間隔の倍数）。
+                        // ここを割ると液体と空気がすれ違えず交換が止まる
+    offset    : 0.0,    // 仕切りの高さ（0が中央）
+    taper     : 0.10,   // 出入口のひろがり
+  },
+
+  // --- 流体（二相 3D Position Based Fluids: 液体＋空気） ---
+  //   相は質量だけが違う。浮力は与えない。上に乗った液体の重みが拘束を通じて伝わり、
+  //   軽い空気粒子だけが大きく押し退けられる。その結果として浮き上がる。
+  sim: {
+    particles : 0,       // 目標粒子数。0 なら端末を見て決める
+    substeps  : 1,       // 1フレームあたりの物理ステップ
+    iters     : 5,       // 密度拘束の反復回数。
+                         // 閉じた容器では圧力が伝わるのに反復が要る
+    hFactor   : 2.0,     // 平滑化半径 = hFactor × 粒子間隔
+    cellCap   : 40,      // 1セルに入る粒子の上限
+
+    densityRatio : 18.0, // 液体/空気 の質量比。実際は800倍だが解が荒れるので抑える
+                         // （浮力は 1−1/比 なので、18倍で0.94）
+    fillTop   : 0.90,    // 上の部屋のどこまでを液体にするか
+
+    // 液体のりのような、重くはないがとても粘る液体を想定している。
+    // 重力は控えめにし、粘りは下の viscosity（粒子どうしの速度の均し）で作る。
+    gravity   : 0.95,
+    damping   : 0.40,    // 全体の減衰は補助。主役は viscosity
+    maxVel    : 0.45,
+
+    relax     : 0.012,   // CFM。λの分母に対する割合
+    sCorrK    : 0.015,   // 人工圧力。λの大きさに対する割合（同じ相どうしのみ）
+    sCorrN    : 4.0,
+    sCorrQ    : 0.22,
+
+    viscosity : 0.95,    // 同じ相どうしの XSPH。これがせん断粘性になる
+    viscCross : 0.30,    // 相をまたぐ XSPH。液体が泡の動きを抑える
+    viscIters : 3,       // 1ステップあたりの粘性の回数。多いほど粘る。
+                         // 通路が細いときだけよく効く（太い穴ではほとんど効かない）
+    cohesionLiq: 1.35,   // 液体の凝集。界面張力になり、液をまとめて細く引き伸ばす。
+                         // 上げすぎると通路で栓になって交換が止まる（2.2で停止）
+    cohesionGas: 0.22,   // 空気の凝集。強いと壁ぎわに貼りついて抜けなくなる
+    phaseRepel : 0.16,   // 相をまたぐ斥力（粒子間隔に対する比）。界面を混ざらせない。
+                         // 実物では空気と液体が混ざる動きは見えないので、強めに保つ
+
+    adhesion  : 0.10,    // 壁への付着（液体のみ）。強いと壁と液の間に空気を閉じ込める
+    wallFric  : 0.95,    // 壁に触れている液体の接線方向の減衰。
+                         // 細い通路では、これが流れを止める主な力になる
+    wallFricGas: 0.20,   // 空気は壁を濡らさないので滑る
+    wallBand  : 1.6,     // 壁の効果が及ぶ距離（粒子間隔の倍数）
+    radius    : 0.45,    // 衝突半径（粒子間隔の倍数）
+    drawRadius: 1.05,    // 描画時の球の半径（粒子間隔の倍数）。重ねて面をなめらかに
+    renderFollow: 0.30,  // 描画用の位置がソルバに追従する割合（小さいほど揺れが減る）
+    // 渦。実物では「細い紐が落ちているとき、ごくたまに揺れて回って見える」程度の
+    // 微細な現象で、太い塊や容器全体が回るようなことは起こらない。
+    // 細い紐は拘束が弱いので、ごく弱い力でも揺れが見える。
+    swirl     : 0.07,
+    swirlWidth: 0.30,    // 渦が効く範囲（穴からの距離）
+
+    // 空気の持ち方。'grid' は空気を粒子にせず格子で持ち、圧力を格子で全体一度に解く。
+    // 密閉容器の気圧は部屋全体で1つの値なので、隣どうしでしか伝わらない粒子の
+    // 拘束では表せない（下の部屋の空気が5%縮むだけで、液は真空に落ちるように流れた）。
+    // ?air=particles で以前の二相粒子に戻せる（比べる用）。
+    air       : 'grid',
+    gridCell  : 1.5,     // 圧力格子の粗いセルの幅（粒子間隔の倍数）
+    gridFine  : 1.0,     // 穴のまわりの細かいセルの幅（粒子間隔の倍数）。穴の直径に6セル入る。
+                         // 4セルだと穴の中で液と空気が交代でしか通れず、落ちる液がしずくに分かれる
+    fineBandXZ: 2.0,     // 細かい帯の横の半幅（穴の半径の倍数）。高さ方向にはずっと続く
+    fineBandY : 3.0,     // 細かい帯の縦の半幅（仕切りの厚みの半分に、穴の半径のこの倍数を足す）
+    cgIters   : 30,      // 圧力を解く共役勾配法の反復。前のステップの解から始め、上下の部屋の
+                         // 圧力差は別にまとめて直す（gsCh*）ので少なくてよい
+    flip      : 0.5,     // 格子から粒子へ速度を戻すときの FLIP の割合。0 で PIC（よく粘る）
+    phiFull   : 0.9,     // 液体の粒子がこの割合まで入っていれば、その面は液体で満杯とみなす。
+                         // 1セルに粒子は3〜4個しかなく数がばらつくので、1.0 だと液体の中に
+                         // 軽い「空気」の点ができて浮き上がり、縦のすじになる
+    gridVisc  : 3.0,     // 格子での粘性 α = ν·dt/dx²。パネルの「粘り」で 0.5〜3.5 に動く。
+                         // 泡が丸くなり、液の動きがなめらかになる。落ちる液がしずくに分かれるのは
+                         // 穴で液と空気が交代でしか通れないためで、粘性を10倍にしても直らなかった
+    gridViscIters: 10,   // 粘性のヤコビ法の反復（×2+1 回）
+    gridViscWall: 0,     // 1 で壁に粘性をかける（滑らない）、0 で滑る。
+                         // 1 だと細い穴がほぼ詰まる（壁の摩擦は粒子側の wallFric が受け持つ）
+    volCorr   : 0.15,    // 液体のセルの粒子の詰まりを均す強さ（1ステップで戻す割合）。
+                         // 0 にすると液体の中に縦のすじができる
+  },
+};
+/* ==========================================================================
+   SHAPES — 容器の形
+   ------------------------------------------------------------------------
+   正規化空間。y が筒の軸。おおよそ y ∈ [-1, 1] に収める。
+   outer  : 固体の外形
+   cavity : 内部の空洞
+   固体 = outer ∧ ¬cavity （自動導出）
+   ========================================================================== */
+
+// 画面の比率から容器を作る。外形の半高を 1 とし、外形の半径を画面の比率に合わせるので、
+// 画面いっぱいが容器になる（スマホそのものがウーズチューブになる）。
+// 角は丸めない。アクリル樹脂を機械加工したときのように稜線を立たせる。
+const SHAPE_BUILDERS = {
+
+  // 実物のウーズチューブ。外形はまっすぐな筒で、中央に穴の開いた仕切り板がある。
+  oozeTube(A, targetN){
+    const outerR = A;
+    const wall   = Math.max(0.016, outerR*0.072);
+    const R      = outerR - wall;                 // 空洞の半径
+    const H      = 1.0 - wall;                    // 空洞の半高
+    const K      = CONFIG.neck;
+    // 仮の体積から粒子間隔を見積もり、通路の寸法を決める
+    const s0     = Math.cbrt(Math.PI*R*R*2*H*0.9/Math.max(targetN, 1));
+    const holeR  = Math.max(R*K.holeRatio, s0*K.minCells);
+    const plate  = holeR*K.lenRatio;              // 通路の半分の長さ
+    const oy     = Math.max(-H + plate*2.5, Math.min(H - plate*2.5, K.offset || 0));
+    const vol    = Math.PI*R*R*(2*H - 2*plate);
+    const s      = Math.cbrt(vol/Math.max(targetN, 1));
+
+    return {
+      label : 'ウーズチューブ',
+      bound : { r: outerR*1.03, h: 1.02 },        // レイマーチの打ち切り用
+      cavityBound : { r: R, h: H },
+      plateHalf   : plate,
+      orifice     : { p: [0, oy, 0], r: holeR },
+      spacing     : s,
+
+      outer : { op:'roundedCylinder', r: outerR, h: 1.0, round: 0.004 },
+
+      cavity: { op:'sub', k: 0.005,
+        a: { op:'roundedCylinder', r: R, h: H, round: 0.004 },
+        b: { op:'plateWithHole', halfThick: plate, holeR: holeR, taper: K.taper, k: 0.005,
+             at: [0, oy, 0] },
+      },
+    };
+  },
+
+  // 仕組みの確認用（UIには出さない。?shape=hourglass で見られる）
+  hourglass(A, targetN){
+    const k = A/0.46;                              // 画面の比率に合わせて太らせる
+    const prof = (pts) => pts.map(([y, r]) => [y, r*k]);
+    const R = 0.37*k, H = 0.965;
+    const vol = Math.PI*R*R*2*H*0.55;
+    const s   = Math.cbrt(vol/Math.max(targetN, 1));
+    return {
+      label : '砂時計型',
+      bound : { r: 0.42*k, h: 1.02 },
+      cavityBound : { r: R, h: H },
+      plateHalf   : 0.05,
+      orifice     : { p: [0, 0, 0], r: Math.max(0.055*k, s*2.8) },
+      spacing     : s,
+
+      outer : { op:'revolve', round:0.004, profile: prof([
+        [-1.000, 0.00], [-1.000, 0.38], [-0.985, 0.40], [-0.62, 0.40],
+        [-0.30, 0.30], [-0.06, 0.085], [ 0.00, 0.075], [ 0.06, 0.085],
+        [ 0.30, 0.30], [ 0.62, 0.40], [ 0.985, 0.40], [ 1.000, 0.38],
+        [ 1.000, 0.00],
+      ])},
+
+      cavity: { op:'revolve', round:0.004, profile: prof([
+        [-0.962, 0.00], [-0.962, 0.345], [-0.60, 0.360],
+        [-0.28, 0.265], [-0.05, 0.055], [ 0.00, 0.045], [ 0.05, 0.055],
+        [ 0.28, 0.265], [ 0.60, 0.360], [ 0.962, 0.345], [ 0.962, 0.00],
+      ])},
+    };
+  },
+};
+
+// 画面の比率が分かってから作る。極端な比率にならないよう幅を制限する。
+let SHAPE = null;
+function buildShape(aspect){
+  const A = Math.min(CONFIG.view.maxTubeAspect, Math.max(0.16, aspect));
+  const b = SHAPE_BUILDERS[CONFIG.shape] || SHAPE_BUILDERS.oozeTube;
+  SHAPE = b(A, CONFIG.sim.particles);
+  SHAPE.aspect = A;
+  return SHAPE;
+}
+
+if (QS.get('air') === 'particles') CONFIG.sim.air = 'particles';
+CONFIG_DEFAULTS = JSON.parse(JSON.stringify(CONFIG));
+const GRID_AIR = () => CONFIG.sim.air === 'grid';
+
+// 調整用: ?sim.cohesionLiq=0.6 のように、数値のパラメータをURLから上書きできる。
+(() => {
+  for (const [k, v] of QS.entries()) {
+    const m = k.match(/^(sim|liquid|glass|view|env|neck)\.(\w+)$/);
+    if (!m) continue;
+    const obj = CONFIG[m[1]];
+    if (obj && typeof obj[m[2]] === 'number') obj[m[2]] = parseFloat(v);
+  }
+})();
+
+// 粒子数は端末に合わせて決める。?p=40000 で上書きできる。
+// 二相（液体＋空気）を空洞いっぱいに詰めるので、初版より多めに要る。
+(() => {
+  if (QS.has('p')) { CONFIG.sim.particles = Math.max(3000, Math.min(600000, +QS.get('p'))); return; }
+  const coarse = matchMedia('(pointer: coarse)').matches;
+  const cores  = navigator.hardwareConcurrency || 4;
+  // ソルバが時間の大半を使うので、ここが実質の性能つまみ。
+  // 紐の太さは粒子数の3乗根でしか細くならない（8倍にして半分）。
+  // 20fps 前後を許容して、実測で回る上限に寄せてある。
+  CONFIG.sim.particles = coarse ? (cores >= 6 ? 110000 : 45000)
+                                : (cores >= 8 ? 120000 : 60000);
+  // 空気を格子で持つと、粒子は液体だけになるが圧力の格子のぶん重い（Mac で 12万 78ms、6万 36ms/step）。
+  // スマホは GPU が遅いので6万に抑える
+  if (GRID_AIR() && coarse) CONFIG.sim.particles = 60000;
+})();
+
+/* ==========================================================================
+   SDFGEN — 形データから符号付き距離関数を作る
+   ------------------------------------------------------------------------
+   同じ木構造から
+     ・WGSL の式（WebGPU のシェーダ用）
+     ・GLSL の式（WebGL2 のシェーダ用）
+     ・JavaScript の評価関数（粒子の初期配置と泡の壁当たり判定用）
+   を作る。シェーダ側は文字列生成、JS側は木をそのまま解釈する。
+   ========================================================================== */
+
+// --- シェーダ共通の距離関数ライブラリ（WGSL） ---
+const SDF_LIB_WGSL = `
+fn dot2(v: vec2f) -> f32 { return dot(v, v); }
+
+fn smin(a: f32, b: f32, k: f32) -> f32 {
+  let h = clamp(0.5 + 0.5*(b - a)/k, 0.0, 1.0);
+  return mix(b, a, h) - k*h*(1.0 - h);
+}
+fn smax(a: f32, b: f32, k: f32) -> f32 {
+  let h = clamp(0.5 - 0.5*(b - a)/k, 0.0, 1.0);
+  return mix(b, a, h) + k*h*(1.0 - h);
+}
+fn sdSphere(p: vec3f, r: f32) -> f32 { return length(p) - r; }
+
+fn sdRoundBox(p: vec3f, b: vec3f, r: f32) -> f32 {
+  let q = abs(p) - (b - vec3f(r));
+  return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
+}
+fn sdRoundedCyl(p: vec3f, r: f32, h: f32, rd: f32) -> f32 {
+  let d = vec2f(length(p.xz) - (r - rd), abs(p.y) - (h - rd));
+  return min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0))) - rd;
+}
+fn sdTorusY(p: vec3f, R: f32, r: f32) -> f32 {
+  return length(vec2f(length(p.xz) - R, p.y)) - r;
+}
+fn sdCappedCone(p: vec3f, r1: f32, r2: f32, h: f32) -> f32 {
+  let q  = vec2f(length(p.xz), p.y);
+  let k1 = vec2f(r2, h);
+  let k2 = vec2f(r2 - r1, 2.0*h);
+  let ca = vec2f(q.x - min(q.x, select(r2, r1, q.y < 0.0)), abs(q.y) - h);
+  let cb = q - k1 + k2*clamp(dot(k1 - q, k2)/dot2(k2), 0.0, 1.0);
+  let s  = select(1.0, -1.0, cb.x < 0.0 && ca.y < 0.0);
+  return s*sqrt(min(dot2(ca), dot2(cb)));
+}
+// 穴の開いた仕切り板。穴は中心から離れるほど広がる（漏斗状）。
+fn sdPlateWithHole(p: vec3f, ht: f32, hr: f32, taper: f32, k: f32) -> f32 {
+  let slab = abs(p.y) - ht;
+  let hole = length(p.xz) - (hr + taper*abs(p.y));
+  return smax(slab, -hole, k);
+}
+`;
+
+// --- プリミティブごとの式の組み立て ---
+// emit[op](node, P, lang) -> 式の文字列。P は vec3 の式。
+const SDF_EMIT = {
+  sphere: (n, P, L) => `sdSphere(${P}, ${f(n.r)})`,
+
+  box: (n, P, L) =>
+    `sdRoundBox(${P}, ${vec3(L, n.b || [n.bx, n.by, n.bz])}, ${f(n.round || 0)})`,
+
+  roundedCylinder: (n, P, L) =>
+    `sdRoundedCyl(${P}, ${f(n.r)}, ${f(n.h)}, ${f(n.round || 0)})`,
+
+  torus: (n, P, L) => `sdTorusY(${P}, ${f(n.R)}, ${f(n.r)})`,
+
+  cone: (n, P, L) => `sdCappedCone(${P}, ${f(n.r0)}, ${f(n.r1)}, ${f(n.h)})`,
+
+  plateWithHole: (n, P, L) =>
+    `sdPlateWithHole(${P}, ${f(n.halfThick)}, ${f(n.holeR)}, ${f(n.taper || 0)}, ${f(n.k || 0.004)})`,
+
+  // 回転体。(y, 半径) の折れ線を軸で閉じた多角形として距離を取る。
+  revolve: (n, P, L) => `${revolveFn(n, L)}(${P})`,
+};
+
+// 数値の整形（シェーダは小数点必須）
+function f(v){
+  const x = Number(v);
+  if (!isFinite(x)) throw new Error('SDF: 数値でない値 ' + v);
+  let s = x.toFixed(6).replace(/0+$/, '');
+  if (s.endsWith('.')) s += '0';
+  return s;
+}
+function vec3(L, a){
+  const b = `${f(a[0])}, ${f(a[1])}, ${f(a[2])}`;
+  return L === 'wgsl' ? `vec3f(${b})` : `vec3(${b})`;
+}
+
+// revolve 用の関数を言語ごとに生成してキャッシュする
+const revolveCache = { wgsl: new Map(), glsl: new Map() };
+function revolveFn(node, L){
+  const key = JSON.stringify([node.profile, node.round || 0]);
+  const cache = revolveCache[L];
+  if (cache.has(key)) return cache.get(key).name;
+
+  const name = `sdRev${cache.size}`;
+  // 折れ線（y, r）を (x=r, y=y) の2D多角形にし、軸（r=0）で閉じる
+  const pts = node.profile.map(([y, r]) => [r, y]);
+  if (pts[0][0] > 1e-6)                 pts.unshift([0, pts[0][1]]);
+  if (pts[pts.length-1][0] > 1e-6)      pts.push([0, pts[pts.length-1][1]]);
+
+  const N = pts.length;
+  const V = (i) => L === 'wgsl'
+    ? `vec2f(${f(pts[i][0])}, ${f(pts[i][1])})`
+    : `vec2(${f(pts[i][0])}, ${f(pts[i][1])})`;
+
+  const body = [];
+  if (L === 'wgsl') {
+    body.push(`fn ${name}(p: vec3f) -> f32 {`);
+    body.push(`  let q = vec2f(length(p.xz), p.y);`);
+    body.push(`  var d = dot2(q - ${V(0)});`);
+    body.push(`  var s = 1.0;`);
+    for (let i = 0, j = N - 1; i < N; j = i, i++) {
+      body.push(`  {`);
+      body.push(`    let vi = ${V(i)}; let vj = ${V(j)};`);
+      body.push(`    let e = vj - vi; let w = q - vi;`);
+      body.push(`    let b = w - e*clamp(dot(w, e)/dot2(e), 0.0, 1.0);`);
+      body.push(`    d = min(d, dot2(b));`);
+      body.push(`    let c = vec3<bool>((q.y >= vi.y), (q.y < vj.y), (e.x*w.y > e.y*w.x));`);
+      body.push(`    if (all(c) || all(!c)) { s = -s; }`);
+      body.push(`  }`);
+    }
+    body.push(`  return s*sqrt(d) - ${f(node.round || 0)};`);
+    body.push(`}`);
+  } else {
+    body.push(`float ${name}(vec3 p) {`);
+    body.push(`  vec2 q = vec2(length(p.xz), p.y);`);
+    body.push(`  float d = dot(q - ${V(0)}, q - ${V(0)});`);
+    body.push(`  float s = 1.0;`);
+    for (let i = 0, j = N - 1; i < N; j = i, i++) {
+      body.push(`  {`);
+      body.push(`    vec2 vi = ${V(i)}; vec2 vj = ${V(j)};`);
+      body.push(`    vec2 e = vj - vi; vec2 w = q - vi;`);
+      body.push(`    vec2 b = w - e*clamp(dot(w, e)/dot(e, e), 0.0, 1.0);`);
+      body.push(`    d = min(d, dot(b, b));`);
+      body.push(`    bvec3 c = bvec3(q.y >= vi.y, q.y < vj.y, e.x*w.y > e.y*w.x);`);
+      body.push(`    if (all(c) || all(not(c))) s = -s;`);
+      body.push(`  }`);
+    }
+    body.push(`  return s*sqrt(d) - ${f(node.round || 0)};`);
+    body.push(`}`);
+  }
+  cache.set(key, { name, src: body.join('\n') });
+  return name;
+}
+
+// 木 -> 式。ブール演算は滑らかな min/max（k=0 なら通常の min/max）。
+function sdfExpr(node, L, P = 'p'){
+  if (!node) throw new Error('SDF: ノードが空');
+  const k = node.k || 0;
+
+  if (node.at) {
+    const off = vec3(L, node.at);
+    const inner = Object.assign({}, node); delete inner.at;
+    return sdfExpr(inner, L, `(${P} - ${off})`);
+  }
+
+  if (node.op === 'union' || node.op === 'sub' || node.op === 'inter') {
+    const a = sdfExpr(node.a, L, P);
+    const b = sdfExpr(node.b, L, P);
+    if (node.op === 'union') return k > 0 ? `smin(${a}, ${b}, ${f(k)})` : `min(${a}, ${b})`;
+    if (node.op === 'inter') return k > 0 ? `smax(${a}, ${b}, ${f(k)})` : `max(${a}, ${b})`;
+    return k > 0 ? `smax(${a}, -(${b}), ${f(k)})` : `max(${a}, -(${b}))`;
+  }
+
+  const emit = SDF_EMIT[node.op];
+  if (!emit) throw new Error('SDF: 未知の op ' + node.op);
+  return emit(node, P, L);
+}
+
+// 形 -> シェーダのソース片（revolve の関数定義 + sdOuter / sdCavity）
+function buildShapeSource(shape, L){
+  revolveCache[L].clear();
+  const outerExpr  = sdfExpr(shape.outer,  L);
+  const cavityExpr = sdfExpr(shape.cavity, L);
+  const defs = [...revolveCache[L].values()].map(v => v.src).join('\n');
+
+  if (L === 'wgsl') {
+    return `${defs}
+fn sdOuter(p: vec3f) -> f32 { return ${outerExpr}; }
+fn sdCavity(p: vec3f) -> f32 { return ${cavityExpr}; }
+fn sdBody(p: vec3f) -> f32 { return max(sdOuter(p), -sdCavity(p)); }
+`;
+  }
+  return `${defs}
+float sdOuter(vec3 p) { return ${outerExpr}; }
+float sdCavity(vec3 p) { return ${cavityExpr}; }
+float sdBody(vec3 p) { return max(sdOuter(p), -sdCavity(p)); }
+`;
+}
+
+/* --- JS 側の評価（粒子の初期配置、泡の壁当たり判定） --- */
+
+const Jsd = {
+  smin: (a, b, k) => { const h = Math.min(1, Math.max(0, 0.5 + 0.5*(b-a)/k)); return b + (a-b)*h - k*h*(1-h); },
+  smax: (a, b, k) => { const h = Math.min(1, Math.max(0, 0.5 - 0.5*(b-a)/k)); return b + (a-b)*h + k*h*(1-h); },
+  len2: (x, y) => Math.hypot(x, y),
+};
+
+function sdfEval(node, x, y, z){
+  if (node.at) { x -= node.at[0]; y -= node.at[1]; z -= node.at[2]; 
+    const inner = Object.assign({}, node); delete inner.at;
+    return sdfEval(inner, x, y, z); }
+
+  const k = node.k || 0;
+  switch (node.op) {
+    case 'union': {
+      const a = sdfEval(node.a, x,y,z), b = sdfEval(node.b, x,y,z);
+      return k > 0 ? Jsd.smin(a, b, k) : Math.min(a, b);
+    }
+    case 'inter': {
+      const a = sdfEval(node.a, x,y,z), b = sdfEval(node.b, x,y,z);
+      return k > 0 ? Jsd.smax(a, b, k) : Math.max(a, b);
+    }
+    case 'sub': {
+      const a = sdfEval(node.a, x,y,z), b = sdfEval(node.b, x,y,z);
+      return k > 0 ? Jsd.smax(a, -b, k) : Math.max(a, -b);
+    }
+    case 'sphere': return Math.hypot(x,y,z) - node.r;
+    case 'box': {
+      const b = node.b || [node.bx, node.by, node.bz], r = node.round || 0;
+      const qx = Math.abs(x) - (b[0]-r), qy = Math.abs(y) - (b[1]-r), qz = Math.abs(z) - (b[2]-r);
+      const ox = Math.max(qx,0), oy = Math.max(qy,0), oz = Math.max(qz,0);
+      return Math.hypot(ox,oy,oz) + Math.min(Math.max(qx, Math.max(qy,qz)), 0) - r;
+    }
+    case 'roundedCylinder': {
+      const rd = node.round || 0;
+      const dx = Jsd.len2(x,z) - (node.r - rd), dy = Math.abs(y) - (node.h - rd);
+      return Math.min(Math.max(dx,dy),0) + Math.hypot(Math.max(dx,0), Math.max(dy,0)) - rd;
+    }
+    case 'torus': return Jsd.len2(Jsd.len2(x,z) - node.R, y) - node.r;
+    case 'cone': {
+      const qx = Jsd.len2(x,z), qy = y;
+      const r1 = node.r0, r2 = node.r1, h = node.h;
+      const cax = qx - Math.min(qx, qy < 0 ? r1 : r2), cay = Math.abs(qy) - h;
+      const k2x = r2 - r1, k2y = 2*h;
+      const t = Math.min(1, Math.max(0, ((r2-qx)*k2x + (h-qy)*k2y)/(k2x*k2x + k2y*k2y)));
+      const cbx = qx - r2 + k2x*t, cby = qy - h + k2y*t;
+      const s = (cbx < 0 && cay < 0) ? -1 : 1;
+      return s*Math.sqrt(Math.min(cax*cax+cay*cay, cbx*cbx+cby*cby));
+    }
+    case 'plateWithHole': {
+      const slab = Math.abs(y) - node.halfThick;
+      const hole = Jsd.len2(x,z) - (node.holeR + (node.taper||0)*Math.abs(y));
+      const kk = node.k || 0.004;
+      return kk > 0 ? Jsd.smax(slab, -hole, kk) : Math.max(slab, -hole);
+    }
+    case 'revolve': {
+      const pts = revolvePts(node);
+      const qx = Jsd.len2(x,z), qy = y;
+      let d = (qx-pts[0][0])**2 + (qy-pts[0][1])**2, s = 1;
+      for (let i = 0, j = pts.length-1; i < pts.length; j = i, i++) {
+        const vix = pts[i][0], viy = pts[i][1], vjx = pts[j][0], vjy = pts[j][1];
+        const ex = vjx-vix, ey = vjy-viy, wx = qx-vix, wy = qy-viy;
+        const t = Math.min(1, Math.max(0, (wx*ex+wy*ey)/(ex*ex+ey*ey)));
+        const bx = wx - ex*t, by = wy - ey*t;
+        d = Math.min(d, bx*bx+by*by);
+        const c1 = qy >= viy, c2 = qy < vjy, c3 = ex*wy > ey*wx;
+        if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) s = -s;
+      }
+      return s*Math.sqrt(d) - (node.round || 0);
+    }
+    default: throw new Error('SDF(JS): 未知の op ' + node.op);
+  }
+}
+
+const revolvePtsCache = new WeakMap();
+function revolvePts(node){
+  let pts = revolvePtsCache.get(node);
+  if (pts) return pts;
+  pts = node.profile.map(([y, r]) => [r, y]);
+  if (pts[0][0] > 1e-6) pts.unshift([0, pts[0][1]]);
+  if (pts[pts.length-1][0] > 1e-6) pts.push([0, pts[pts.length-1][1]]);
+  revolvePtsCache.set(node, pts);
+  return pts;
+}
+
+const SD = {
+  outer : (x,y,z) => sdfEval(SHAPE.outer,  x,y,z),
+  cavity: (x,y,z) => sdfEval(SHAPE.cavity, x,y,z),
+  body  : (x,y,z) => Math.max(sdfEval(SHAPE.outer, x,y,z), -sdfEval(SHAPE.cavity, x,y,z)),
+  // 空洞の勾配（外向き）。泡の壁当たり判定に使う。
+  cavityGrad: (x,y,z,out) => {
+    const e = 0.002;
+    const gx = SD.cavity(x+e,y,z) - SD.cavity(x-e,y,z);
+    const gy = SD.cavity(x,y+e,z) - SD.cavity(x,y-e,z);
+    const gz = SD.cavity(x,y,z+e) - SD.cavity(x,y,z-e);
+    const l = Math.hypot(gx,gy,gz) || 1;
+    out[0]=gx/l; out[1]=gy/l; out[2]=gz/l;
+    return out;
+  },
+};
+
+/* ==========================================================================
+   SEED — 粒子の初期配置
+   ------------------------------------------------------------------------
+   上の部屋（穴より上）を液体で満たした状態から始める。読み込んだ直後から
+   垂れ始めるので、何が起きるかがすぐ分かる。
+   格子の間隔は、目標の粒子数に合うように体積から逆算する。
+   ========================================================================== */
+
+function poly6(r2, h){
+  const h2 = h*h;
+  if (r2 >= h2) return 0;
+  const d = h2 - r2;
+  return 315/(64*Math.PI*Math.pow(h,9)) * d*d*d;
+}
+
+// 同じ格子で SPH 密度を求め、これを静止密度とする（ソルバの条件が揃う）
+function latticeDensity(s, h){
+  const n = Math.ceil(h/s) + 1;
+  let d = 0;
+  for (let i = -n; i <= n; i++)
+    for (let j = -n; j <= n; j++)
+      for (let k = -n; k <= n; k++)
+        d += poly6((i*i + j*j + k*k)*s*s, h);
+  return d;
+}
+
+// 単純立方格子で詰める。層ごとにずらすと latticeDensity の基準と
+// 詰まり具合が合わなくなり、密度拘束が不活性になってしまう（圧力が立たない）。
+function latticeFill(s, R, y0, y1){
+  const out = [];
+  const n = Math.ceil(R/s) + 1;
+  for (let y = y0 + 0.5*s; y <= y1; y += s) {
+    for (let ix = -n; ix <= n; ix++) {
+      const x = ix*s;
+      for (let iz = -n; iz <= n; iz++) {
+        const z = iz*s;
+        if (x*x + z*z > R*R) continue;
+        if (SD.cavity(x, y, z) > -0.55*s) continue;
+        out.push(x, y, z);
+      }
+    }
+  }
+  return out;
+}
+
+// 空洞全体を粒子で埋め、上の部屋を液体、残りを空気にする。
+// 液体を前半、空気を後半にまとめて並べるので、描画では firstInstance を
+// 変えるだけで相ごとに描ける。相は途中で変わらないので並べ替えも要らない。
+function seedParticles(target){
+  const cb = SHAPE.cavityBound;
+
+  // 相を決める：穴より上を液体にし、上端には空気の層を残す
+  const yBot = SHAPE.orifice.p[1] + SHAPE.plateHalf;
+  const yTop = yBot + (cb.h - yBot)*CONFIG.sim.fillTop;
+  // 空気を格子で持つときは液体だけを置くので、目標は液体の粒子数になる
+  const grid = GRID_AIR();
+  const countOf = (p) => {
+    if (!grid) return p.length/3;
+    let n = 0;
+    for (let i = 1; i < p.length; i += 3) if (p[i] > yBot && p[i] < yTop) n++;
+    return n;
+  };
+
+  // 目標の粒子数になるよう格子間隔を調整する
+  let s = SHAPE.spacing, pts = [], used = s;
+  for (let pass = 0; pass < 6; pass++) {
+    used = s;
+    pts = latticeFill(s, cb.r, -cb.h, cb.h);
+    const n = countOf(pts);
+    if (n === 0) { s *= 0.6; continue; }
+    const ratio = n/target;
+    if (Math.abs(ratio - 1) < 0.04) break;
+    s *= Math.cbrt(ratio);
+  }
+  s = used;
+
+  // 確認用: ?seed=bubble で、上の部屋の中ほどに空気の塊を置く。
+  // 浮力だけを切り分けて見られる。
+  const bub = QS.get('seed') === 'bubble';
+  const bc  = [0, (yBot + yTop)*0.5, 0];
+  const br  = cb.r*0.35;
+
+  const liq = [], gas = [];
+  const N = pts.length/3;
+  for (let i = 0; i < N; i++) {
+    const x = pts[i*3+0], y = pts[i*3+1], z = pts[i*3+2];
+    let isLiq = (y > yBot && y < yTop);
+    if (isLiq && bub) {
+      const dx = x - bc[0], dy = y - bc[1], dz = z - bc[2];
+      if (dx*dx + dy*dy + dz*dz < br*br) isLiq = false;
+    }
+    (isLiq ? liq : gas).push(i);
+  }
+
+  const order = grid ? liq : liq.concat(gas);
+  const NP  = order.length;
+  const arr = new Float32Array(NP*4);
+  for (let k = 0; k < NP; k++) {
+    const i = order[k];
+    arr[k*4+0] = pts[i*3+0] + (Math.random()-0.5)*s*0.10;
+    arr[k*4+1] = pts[i*3+1] + (Math.random()-0.5)*s*0.10;
+    arr[k*4+2] = pts[i*3+2] + (Math.random()-0.5)*s*0.10;
+    arr[k*4+3] = k < liq.length ? 0 : 1;      // 参考用（シェーダは添字で判定する）
+  }
+  return { positions: arr, count: NP, nLiquid: liq.length, spacing: s };
+}
+
+/* ==========================================================================
+   SIM WGSL — 3D Position Based Fluids の計算シェーダ
+   ------------------------------------------------------------------------
+   1ステップの流れ
+     csPredict  重力を加えて予測位置を出す
+     csClear    近傍グリッドを消す
+     csBuild    予測位置からグリッドを作る（1セルの上限は cellCap）
+     csLambda   密度拘束の λ を求める     ┐
+     csDelta    位置の補正を適用する      ┘ これを iters 回
+     csFinal    速度を確定して位置を更新する
+     csVisc     XSPH粘性・凝集・壁への付着
+     csApplyVel 速度を書き戻す
+   ========================================================================== */
+
+function buildSimWGSL(shape, cellCap){
+  const shapeSrc = buildShapeSource(shape, 'wgsl');
+  return `
+struct SP {
+  grav  : vec4f,   // xyz = 重力加速度, w = dt
+  grid  : vec4f,   // xyz = グリッド原点, w = セル幅
+  dims  : vec4u,   // xyz = セル数, w = 粒子数
+  kern  : vec4f,   // x = h, y = poly6係数, z = spiky係数, w = 格子の数密度
+  solve : vec4f,   // x = relax, y = sCorrK, z = sCorrN, w = W(Δq)
+  visc  : vec4f,   // x = 同相XSPH, y = 液体の凝集, z = 付着, w = 壁摩擦（液体）
+  misc  : vec4f,   // x = 衝突半径, y = 最大速度, z = 壁バンド, w = 減衰
+  phase : vec4f,   // x = 液体の粒子数, y = 空気の逆質量（密度比）, z = 相間斥力の距離, w = 空気の凝集
+  aux   : vec4f,   // x = 相間XSPH, y = 壁摩擦（空気）, z = 相間斥力の強さ, w = 予備
+  swirl : vec4f,   // x = 渦の強さ, y = 効く範囲, z = 粒子に重力を加える割合, w = 予備
+  orif  : vec4f,   // xyz = 穴の中心
+};
+
+@group(0) @binding(0) var<uniform> S: SP;
+@group(0) @binding(1) var<storage, read_write> pos : array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> vel : array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> cur : array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> nxt : array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> lam : array<f32>;
+@group(0) @binding(6) var<storage, read_write> cellCnt : array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read_write> cellItm : array<u32>;
+@group(0) @binding(8) var<storage, read_write> stats   : array<atomic<u32>>;
+
+const CAP : u32 = ${cellCap}u;
+const PI  : f32 = 3.14159265359;
+
+${SDF_LIB_WGSL}
+${shapeSrc}
+
+// 相は添字で決まる（液体が前半、空気が後半。途中で変わらない）
+fn isGas(i: u32) -> bool { return f32(i) >= S.phase.x; }
+// 逆質量。空気は軽いので、同じ押し合いでも大きく動く。
+fn invMassOf(i: u32) -> f32 { return select(1.0, S.phase.y, isGas(i)); }
+
+fn gradCavity(p: vec3f) -> vec3f {
+  let e = 0.0015;
+  let d1 = sdCavity(p + vec3f( e, -e, -e));
+  let d2 = sdCavity(p + vec3f(-e, -e,  e));
+  let d3 = sdCavity(p + vec3f(-e,  e, -e));
+  let d4 = sdCavity(p + vec3f( e,  e,  e));
+  let g  = vec3f(d4 + d1 - d2 - d3, d4 - d1 - d2 + d3, d4 - d1 + d2 - d3);
+  let l  = length(g);
+  if (l < 1e-9) { return vec3f(0.0, 1.0, 0.0); }
+  return g/l;
+}
+
+// 空洞の内側へ押し戻す
+fn confine(p: vec3f) -> vec3f {
+  let r = S.misc.x;
+  let d = sdCavity(p);
+  if (d < -r) { return p; }
+  let n = gradCavity(p);
+  return p - n*(d + r);
+}
+
+fn poly6W(r2: f32) -> f32 {
+  let h2 = S.kern.x*S.kern.x;
+  if (r2 >= h2) { return 0.0; }
+  let d = h2 - r2;
+  return S.kern.y*d*d*d;
+}
+// ∇W(spiky)。r は pi - pj。
+fn spikyG(r: vec3f, d: f32) -> vec3f {
+  let h = S.kern.x;
+  if (d >= h || d < 1e-9) { return vec3f(0.0); }
+  let a = h - d;
+  return (S.kern.z*a*a/d)*r;
+}
+// 凝集カーネル（Akinci）
+fn cohW(d: f32) -> f32 {
+  let h = S.kern.x;
+  if (d >= h || d <= 0.0) { return 0.0; }
+  let c = 32.0/(PI*pow(h, 9.0));
+  let a = h - d;
+  if (2.0*d > h) { return c*a*a*a*d*d*d; }
+  return c*(2.0*a*a*a*d*d*d - pow(h, 6.0)/64.0);
+}
+
+fn cellOf(p: vec3f) -> vec3i {
+  return vec3i(floor((p - S.grid.xyz)/S.grid.w));
+}
+fn cellIdx(c: vec3i) -> i32 {
+  let d = vec3i(S.dims.xyz);
+  if (c.x < 0 || c.y < 0 || c.z < 0 || c.x >= d.x || c.y >= d.y || c.z >= d.z) { return -1; }
+  return (c.z*d.y + c.y)*d.x + c.x;
+}
+
+/* ---------------- 予測 ---------------- */
+@compute @workgroup_size(64)
+fn csPredict(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  let dt = S.grav.w;
+  var v = vel[i].xyz;
+  // 重力は相によらず同じ加速度。空気を格子で持つときは格子の側で加えてある（swirl.z = 0）
+  v += S.grav.xyz*dt*S.swirl.z;
+  v *= max(0.0, 1.0 - S.misc.w*dt);
+  // 渦：穴に近いほど強い接線方向の力を加える。
+  // 実物で渦を巻いて落ちるのは地球の自転ではなく流れの偏りだが、見え方は同じ。
+  let gl = length(S.grav.xyz);
+  if (S.swirl.x > 0.0 && gl > 1e-9) {
+    let up  = -S.grav.xyz/gl;
+    let rel = pos[i].xyz - S.orif.xyz;
+    let ax  = dot(rel, up);
+    let rad = rel - up*ax;
+    let rl  = length(rad);
+    if (rl > 1e-5) {
+      let t = ax/S.swirl.y;
+      v += (cross(up, rad)/rl)*(S.swirl.x*gl*exp(-t*t)*dt);
+    }
+  }
+
+  let sp = length(v);
+  if (sp > S.misc.y) { v *= S.misc.y/sp; }
+  let p = confine(pos[i].xyz + v*dt);
+  vel[i] = vec4f(v, 0.0);
+  cur[i] = vec4f(p, 0.0);
+}
+
+/* ---------------- グリッド ---------------- */
+@compute @workgroup_size(64)
+fn csClear(@builtin(global_invocation_id) gid: vec3u) {
+  let n = S.dims.x*S.dims.y*S.dims.z;
+  if (gid.x >= n) { return; }
+  atomicStore(&cellCnt[gid.x], 0u);
+}
+
+@compute @workgroup_size(64)
+fn csBuild(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  let ci = cellIdx(cellOf(cur[i].xyz));
+  if (ci < 0) { return; }
+  let slot = atomicAdd(&cellCnt[u32(ci)], 1u);
+  if (slot < CAP) { cellItm[u32(ci)*CAP + slot] = i; }
+}
+
+/* ---------------- 密度拘束 ----------------
+   拘束は「粒子の詰まり具合（数密度 Σ W）」にかける。質量を混ぜないので、
+   液体の中に空気粒子が1個あっても無理な圧力が立たず、界面が安定する。
+
+   浮力は位置補正の重み付けから出る。補正量を逆質量で重み付けすると、
+   同じ圧力でも軽い空気は大きく動く。液体の圧力は深いほど高いので、
+   下から押される量が上から押される量を上回り、空気は昇る。
+   浮力を明示的に与えてはいない。                              */
+@compute @workgroup_size(64)
+fn csLambda(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  let pi = cur[i].xyz;
+  let h2 = S.kern.x*S.kern.x;
+  let n0 = S.kern.w;            // 格子の数密度
+  let wi = invMassOf(i);
+
+  var dens = 0.0;
+  var gradI = vec3f(0.0);
+  var gradSum = 0.0;
+
+  let base = cellOf(pi);
+  for (var dz = -1; dz <= 1; dz++) {
+  for (var dy = -1; dy <= 1; dy++) {
+  for (var dx = -1; dx <= 1; dx++) {
+    let ci = cellIdx(base + vec3i(dx, dy, dz));
+    if (ci < 0) { continue; }
+    let cnt = min(atomicLoad(&cellCnt[u32(ci)]), CAP);
+    for (var k = 0u; k < cnt; k++) {
+      let j = cellItm[u32(ci)*CAP + k];
+      let r = pi - cur[j].xyz;
+      let r2 = dot(r, r);
+      if (r2 >= h2) { continue; }
+      dens += poly6W(r2);
+      if (j == i) { continue; }
+      let g = spikyG(r, sqrt(max(r2, 1e-12)))/n0;
+      gradI += g;
+      gradSum += invMassOf(j)*dot(g, g);
+    }
+  }}}
+
+  // 圧縮側だけを解く。膨張側まで拘束すると自由表面が内へ引かれて玉になる。
+  let C = max(dens/n0 - 1.0, 0.0);
+  lam[i] = -C/(wi*dot(gradI, gradI) + gradSum + S.solve.x);
+}
+
+@compute @workgroup_size(64)
+fn csDelta(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  let pi = cur[i].xyz;
+  let h  = S.kern.x;
+  let h2 = h*h;
+  let li = lam[i];
+  let gi = isGas(i);
+  let n0 = S.kern.w;
+  let wi = invMassOf(i);
+  let rep = S.phase.z;
+  var dp = vec3f(0.0);
+
+  let base = cellOf(pi);
+  for (var dz = -1; dz <= 1; dz++) {
+  for (var dy = -1; dy <= 1; dy++) {
+  for (var dx = -1; dx <= 1; dx++) {
+    let ci = cellIdx(base + vec3i(dx, dy, dz));
+    if (ci < 0) { continue; }
+    let cnt = min(atomicLoad(&cellCnt[u32(ci)]), CAP);
+    for (var k = 0u; k < cnt; k++) {
+      let j = cellItm[u32(ci)*CAP + k];
+      if (j == i) { continue; }
+      let r = pi - cur[j].xyz;
+      let r2 = dot(r, r);
+      if (r2 >= h2) { continue; }
+      let d = sqrt(max(r2, 1e-12));
+      let same = (gi == isGas(j));
+      // 人工圧力は同じ相どうしだけ。相をまたいで効かせると界面で引き合ってしまう。
+      var sc = 0.0;
+      if (same) { sc = -S.solve.y*pow(poly6W(r2)/S.solve.w, S.solve.z); }
+      dp += ((li + lam[j] + sc)/n0)*spikyG(r, d);
+      // 相をまたぐ斥力。界面が混ざってぼやけるのを防ぐ。
+      if (!same && d < rep) {
+        let q = 1.0 - d/rep;
+        dp += (S.aux.z*q*q/d)*r;
+      }
+    }
+  }}}
+
+  dp *= wi;                       // ここで浮力が生まれる
+  let lim = select(0.35, 0.50, gi)*h;
+  let dl = length(dp);
+  if (dl > lim) { dp *= lim/dl; }
+  nxt[i] = vec4f(confine(pi + dp), 0.0);
+}
+
+/* ---------------- 速度の確定 ---------------- */
+@compute @workgroup_size(64)
+fn csFinal(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  let dt = S.grav.w;
+  let p  = cur[i].xyz;
+  var v  = (p - pos[i].xyz)/dt;
+  let sp = length(v);
+  if (sp > S.misc.y) { v *= S.misc.y/sp; }
+  if (!(dot(p, p) < 1e6)) {          // 万一の発散を拾う
+    pos[i] = vec4f(0.0, 0.0, 0.0, 0.0);
+    vel[i] = vec4f(0.0);
+    return;
+  }
+  pos[i] = vec4f(p, 0.0);
+  vel[i] = vec4f(v, 0.0);
+}
+
+/* ---------------- 粘性・凝集・壁 ----------------
+   粘りはここで作る。全体の減衰ではなく粒子どうしの速度の均し（XSPH）なので、
+   液が細く垂れるのも、泡がゆっくり昇るのも、同じ粘性から出てくる。   */
+@compute @workgroup_size(64)
+fn csVisc(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  let pi = pos[i].xyz;
+  let vi = vel[i].xyz;
+  let h2 = S.kern.x*S.kern.x;
+  let dt = S.grav.w;
+  let gi = isGas(i);
+  let wi = invMassOf(i);
+
+  var dv = vec3f(0.0);
+  var coh = vec3f(0.0);
+  var wsum = 0.0;
+
+  let base = cellOf(pi);
+  for (var dz = -1; dz <= 1; dz++) {
+  for (var dy = -1; dy <= 1; dy++) {
+  for (var dx = -1; dx <= 1; dx++) {
+    let ci = cellIdx(base + vec3i(dx, dy, dz));
+    if (ci < 0) { continue; }
+    let cnt = min(atomicLoad(&cellCnt[u32(ci)]), CAP);
+    for (var k = 0u; k < cnt; k++) {
+      let j = cellItm[u32(ci)*CAP + k];
+      if (j == i) { continue; }
+      let r = pi - pos[j].xyz;
+      let r2 = dot(r, r);
+      if (r2 >= h2) { continue; }
+      let d = sqrt(max(r2, 1e-12));
+      let w = poly6W(r2);
+      let same = (gi == isGas(j));
+      // 運動量の受け渡しは質量比で効く。液体は空気より圧倒的に重いので、
+      // 空気に囲まれた液滴はほとんど減速しない（宙に浮かない）。
+      // 逆に空気は液体に強く引きずられる。
+      let ratio = wi/invMassOf(j);          // = 相手の質量 / 自分の質量
+      let kv = select(S.aux.x, S.visc.x, same)*min(ratio, 4.0);
+      dv += (vel[j].xyz - vi)*(w*kv);
+      wsum += w;
+      // 凝集は同じ相どうしだけ。これが界面張力になり、泡を丸める。
+      if (same) { coh -= cohW(d)*(r/d); }
+    }
+  }}}
+
+  var v = vi;
+  if (wsum > 1e-8) { v += dv/wsum; }
+  v += select(S.visc.y, S.phase.w, gi)*coh*dt;
+
+  // 壁。付着するのは液体だけで、空気は壁を濡らさないので滑る。
+  let dw = sdCavity(pi);
+  let band = S.misc.z;
+  if (dw > -band) {
+    let n = gradCavity(pi);
+    let k = clamp((dw + band)/band, 0.0, 1.0);
+    let vn = dot(v, n);
+    let vt = v - n*vn;
+    v = n*vn + vt*(1.0 - select(S.visc.w, S.aux.y, gi)*k);
+    if (!gi) { v += n*(S.visc.z*k*dt); }
+  }
+
+  let sp = length(v);
+  if (sp > S.misc.y) { v *= S.misc.y/sp; }
+  nxt[i] = vec4f(v, 0.0);
+}
+
+/* ---------------- 交換量の計測（調整用） ---------------- */
+@compute @workgroup_size(64)
+fn csStatsClear(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= 8u) { return; }
+  atomicStore(&stats[gid.x], 0u);
+}
+
+@compute @workgroup_size(64)
+fn csStats(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  let g = S.grav.xyz;
+  let gl = length(g);
+  if (gl < 1e-9) { return; }
+  let pi = pos[i].xyz;
+  let above = dot(pi, -g/gl) > 0.0;
+  if (isGas(i)) {
+    if (above) { atomicAdd(&stats[0], 1u); }     // 穴より上に来た空気
+  } else {
+    if (!above) { atomicAdd(&stats[1], 1u); }    // 穴より下に落ちた液体
+  }
+
+  // 実際の詰まり具合（静止状態なら 1.0）。拘束が効いているかの確認用。
+  let h2 = S.kern.x*S.kern.x;
+  var dens = 0.0;
+  let base = cellOf(pi);
+  for (var dz = -1; dz <= 1; dz++) {
+  for (var dy = -1; dy <= 1; dy++) {
+  for (var dx = -1; dx <= 1; dx++) {
+    let ci = cellIdx(base + vec3i(dx, dy, dz));
+    if (ci < 0) { continue; }
+    let cnt = min(atomicLoad(&cellCnt[u32(ci)]), CAP);
+    for (var k = 0u; k < cnt; k++) {
+      let r = pi - pos[cellItm[u32(ci)*CAP + k]].xyz;
+      let r2 = dot(r, r);
+      if (r2 < h2) { dens += poly6W(r2); }
+    }
+  }}}
+  let ratio = u32(clamp(dens/S.kern.w, 0.0, 9.0)*1000.0);
+  if (isGas(i)) { atomicMax(&stats[2], ratio); atomicAdd(&stats[3], ratio/100u); }
+  // 壁ぎわ（近傍が片側しかない所）を除いた、下の部屋の空気の詰まり具合
+  if (isGas(i) && !above && sdCavity(pi) < -S.kern.x) {
+    atomicAdd(&stats[6], ratio/10u); atomicAdd(&stats[7], 1u);
+  }
+
+  // 落ちていく紐の太さ。下の部屋の中ほどを薄く輪切りにして、
+  // 軸の近くにある液体の粒子を数える。体積から断面積が出る。
+  if (!isGas(i)) {
+    let up  = -g/gl;
+    let ax  = dot(pi, up);
+    if (ax > -0.55 && ax < -0.40) {
+      let rad = length(pi - up*ax);
+      if (rad < S.aux.w*0.55) { atomicAdd(&stats[4], 1u); }
+      atomicAdd(&stats[5], 1u);
+    }
+  }
+}
+
+@compute @workgroup_size(64)
+fn csApplyVel(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= S.dims.w) { return; }
+  vel[i] = nxt[i];
+}
+`;
+}
+
+/* ==========================================================================
+   GRID WGSL — 空気を格子で持ち、圧力を全体で一度に解く
+   ------------------------------------------------------------------------
+   液体は粒子、空気は格子（MAC 格子の面に速度を置く）。液体と空気をまとめた
+   速度場が「どこでも縮まない」ように、格子全体で圧力を解く。
+   こうすると、液体が下の部屋へ入った分だけ空気が上がらないかぎり液は落ちられない。
+   気圧の力を手で足す必要はない。上の部屋の負圧も、下の部屋の正圧も、
+   圧力の解として自然に出てくる。浮力も、相の密度の違いから出るだけ。
+
+   1ステップの流れ（粒子の PBF の前に走る）
+     gsClear    足し込み用の配列を消す
+     gsP2G      液体粒子の速度と量を格子の面へ足し込む（固定小数点の atomic）
+     gsCombine  面ごとに液体と空気の速度を質量で混ぜ、重力を足す。係数 β = 1/ρ も作る
+     gsVisc*    液体の速度に粘性をかける（陰的な拡散をヤコビ法で。壁は滑らない）
+     gsTgt*     液体の内側の粒子の詰まりを均すための発散の目標（液体の内側で平均0）
+     gsResid    発散から右辺を作り、前回の圧力から残差を出す     ┐
+     gsApply / gsUpdate / gsDir  前処理つき共役勾配法            ┘ cgIters 回
+     gsProject  圧力の勾配で面の速度を直す（ここで縮まなくなる）
+     gsCh*      上下の部屋の圧力差をまとめて1つの値で直す（下の説明）
+     gsAdvect   空気の速度を移流して次のステップへ持ち越す
+     gsG2P      粒子の速度を格子から戻す（PIC と FLIP の混合）。液体のある面だけから拾う
+     gsAirDraw  空気のセルに描画用の球を置く（泡を見せるため。物理には使わない）
+
+   面の速度は配列1本にまとめる。セル (i,j,k) の要素の xyz は、そのセルの
+   −x / −y / −z 側の面。範囲は各方向に1つ多く取り、端の面まで入れる。
+
+   セルの幅は軸ごとに「粗い・細かい・粗い」の3区間で変わる（sim.gridFine）。
+   細かくするのは穴を通る帯だけ。穴の中で液体と空気が同時に通れるだけの細かさを
+   穴にだけ与え、何も起きない部屋の奥は粗いまま解く（Tall Cell の記事の考え方）。
+   x と z の細かい帯は高さ方向にずっと続くので、落ちる紐と昇る泡の通り道も細かくなる。
+   配列は直方体のままなので、計算の形は等間隔のときと同じ。
+   幅が場所で違うぶん、発散は面の面積で、圧力の勾配は中心どうしの距離で重み付けする。
+   長さは粗いセルの幅 hc を単位にした比で持つので、等間隔なら以前と同じ式になる。
+   ========================================================================== */
+
+function buildGridWGSL(shape){
+  const shapeSrc = buildShapeSource(shape, 'wgsl');
+  return `
+struct GP {
+  dim  : vec4u,   // xyz = セル数, w = 粒子数
+  org  : vec4f,   // xyz = 予備, w = 粗いセルの幅 hc
+  par  : vec4f,   // x = dt, y = 空気の密度（液体を1とする）, z = FLIP の割合, w = phiFull
+  grav : vec4f,   // xyz = 重力加速度, w = 粗いセル1つに入る粒子の数 (hc/s)³
+  orif : vec4f,   // xyz = 穴の中心
+  ext  : vec4f,   // x = 粘性 ν·dt/dx², y = 詰まりを均す強さ, z = 壁で滑らない(1)/滑る(0), w = 穴の中の仕切りの行
+  fine : vec4f,   // x = 細かいセルの幅 hf
+  axX  : vec4f,   // 軸ごとの区間: x = 端の座標, y = 手前の粗いセルの数, z = 細かいセルの数
+  axY  : vec4f,
+  axZ  : vec4f,
+};
+
+@group(0) @binding(0)  var<uniform> G: GP;
+@group(0) @binding(1)  var<storage, read_write> acc  : array<atomic<i32>>;
+@group(0) @binding(2)  var<storage, read_write> U    : array<vec4f>;  // xyz 面の速度, w セルの粒子の詰まり（満杯で1、飽和させない）
+@group(0) @binding(3)  var<storage, read_write> A    : array<vec4f>;  // xyz 空気の速度（持ち越し）
+@group(0) @binding(4)  var<storage, read_write> L    : array<vec4f>;  // xyz 重力前の速度（FLIP用）, w セルが空洞なら1
+@group(0) @binding(5)  var<storage, read_write> B    : array<vec4f>;  // xyz 面の係数 β = 1/ρ（閉じた面は0）, w 発散の目標
+@group(0) @binding(6)  var<storage, read_write> P    : array<vec4f>;  // x 圧力, y 残差, z 探索方向, w A·探索方向
+@group(0) @binding(7)  var<storage, read_write> red  : array<f32>;    // 内積の部分和と係数
+@group(0) @binding(8)  var<storage, read_write> pos  : array<vec4f>;
+@group(0) @binding(9)  var<storage, read_write> vel  : array<vec4f>;
+@group(0) @binding(10) var<storage, read_write> stats: array<atomic<u32>>;
+@group(0) @binding(11) var<storage, read_write> rpos : array<vec4f>;  // 描画用の位置（液体の後ろに空気の球を置く）
+
+const SC : f32 = 1048576.0;   // 固定小数点の倍率
+const RED_PART : u32 = 16u;
+const LIQ_CELL : f32 = 0.6;   // 粒子の詰まりがこれ以上なら液体のセルとして均す
+const AIR_CELL : f32 = 0.3;   // これより下なら空気のセルとして描く   // red[16..] が部分和。red[0..] は係数
+// red[0] = r·z, red[1] = α, red[2] = β（共役勾配法の）, red[3] = 発散の目標の平均,
+// red[4] = 上の部屋の発散の合計, red[5] = 穴を横切る面の β の合計
+
+${SDF_LIB_WGSL}
+${shapeSrc}
+
+fn nF() -> u32 { return (G.dim.x + 1u)*(G.dim.y + 1u)*(G.dim.z + 1u); }
+fn fid(c: vec3i) -> u32 {
+  return (u32(c.z)*(G.dim.y + 1u) + u32(c.y))*(G.dim.x + 1u) + u32(c.x);
+}
+fn ijk(f: u32) -> vec3i {
+  let nx = G.dim.x + 1u; let ny = G.dim.y + 1u;
+  return vec3i(i32(f % nx), i32((f / nx) % ny), i32(f / (nx*ny)));
+}
+fn inFaces(c: vec3i) -> bool {
+  return c.x >= 0 && c.y >= 0 && c.z >= 0 &&
+         c.x <= i32(G.dim.x) && c.y <= i32(G.dim.y) && c.z <= i32(G.dim.z);
+}
+fn isCell(c: vec3i) -> bool {
+  return c.x >= 0 && c.y >= 0 && c.z >= 0 &&
+         c.x < i32(G.dim.x) && c.y < i32(G.dim.y) && c.z < i32(G.dim.z);
+}
+fn fluid(c: vec3i) -> bool { return isCell(c) && L[fid(c)].w > 0.5; }
+
+fn ax(a: u32) -> vec3i { return vec3i(i32(a == 0u), i32(a == 1u), i32(a == 2u)); }
+// 面の位置のずれ（セル単位）。x 面は (0, .5, .5) にある
+fn faceOff(a: u32) -> vec3f { return vec3f(0.5) - 0.5*vec3f(ax(a)); }
+
+// --- セルの幅が場所で変わる格子 ---
+fn axP(a: u32) -> vec4f { return select(select(G.axZ, G.axY, a == 1u), G.axX, a == 0u); }
+// 格子の番号（小数も可）→ 座標。区間の中では線形
+fn nodeAt(a: u32, t: f32) -> f32 {
+  let q = axP(a); let hc = G.org.w; let hf = G.fine.x;
+  if (t <= q.y) { return q.x + t*hc; }
+  let x0 = q.x + q.y*hc;
+  if (t <= q.y + q.z) { return x0 + (t - q.y)*hf; }
+  return x0 + q.z*hf + (t - q.y - q.z)*hc;
+}
+// 座標 → 格子の番号（小数）
+fn indexAt(a: u32, x: f32) -> f32 {
+  let q = axP(a); let hc = G.org.w; let hf = G.fine.x;
+  let x0 = q.x + q.y*hc;
+  if (x <= x0) { return (x - q.x)/hc; }
+  let x1 = x0 + q.z*hf;
+  if (x <= x1) { return q.y + (x - x0)/hf; }
+  return q.y + q.z + (x - x1)/hc;
+}
+fn idx3(x: vec3f) -> vec3f { return vec3f(indexAt(0u, x.x), indexAt(1u, x.y), indexAt(2u, x.z)); }
+fn pos3(t: vec3f) -> vec3f { return vec3f(nodeAt(0u, t.x), nodeAt(1u, t.y), nodeAt(2u, t.z)); }
+fn cellCenter(c: vec3i) -> vec3f { return pos3(vec3f(c) + vec3f(0.5)); }
+fn facePos(a: u32, c: vec3i) -> vec3f { return pos3(vec3f(c) + faceOff(a)); }
+// セルの幅（hc を1とする比）
+fn wid(a: u32, i: i32) -> f32 { return (nodeAt(a, f32(i) + 1.0) - nodeAt(a, f32(i)))/G.org.w; }
+fn cellVol(c: vec3i) -> f32 { return wid(0u, c.x)*wid(1u, c.y)*wid(2u, c.z); }
+// 面の面積と、面をはさむセル中心どうしの距離（どちらも hc を単位にした比）
+fn faceArea(a: u32, c: vec3i) -> f32 {
+  return select(wid(0u, c.x), 1.0, a == 0u)*select(wid(1u, c.y), 1.0, a == 1u)*select(wid(2u, c.z), 1.0, a == 2u);
+}
+fn faceDist(a: u32, c: vec3i) -> f32 { return 0.5*(wid(a, c[a]) + wid(a, c[a] - 1)); }
+// 圧力の式の係数 K = β・面積/距離（等間隔なら β）
+fn kOf(a: u32, c: vec3i, b: f32) -> f32 { return b*faceArea(a, c)/faceDist(a, c); }
+
+fn diagOf(c: vec3i) -> f32 {
+  let f = fid(c);
+  var d = 0.0;
+  for (var a = 0u; a < 3u; a++) {
+    d += kOf(a, c, B[f][a]);
+    let cr = c + ax(a);
+    if (inFaces(cr)) { d += kOf(a, cr, B[fid(cr)][a]); }
+  }
+  return d;
+}
+
+// 面の値の三線形補間。a は成分、which = 0 なら U、1 なら L
+fn sampleComp(a: u32, x: vec3f, which: u32) -> f32 {
+  let g  = idx3(x) - faceOff(a);
+  let b  = vec3i(floor(g));
+  let t  = g - floor(g);
+  var s  = 0.0;
+  for (var n = 0u; n < 8u; n++) {
+    let o = vec3i(i32(n & 1u), i32((n >> 1u) & 1u), i32((n >> 2u) & 1u));
+    let c = b + o;
+    if (!inFaces(c)) { continue; }
+    let w = select(1.0 - t.x, t.x, o.x == 1)*select(1.0 - t.y, t.y, o.y == 1)*select(1.0 - t.z, t.z, o.z == 1);
+    let f = fid(c);
+    let v = select(U[f], L[f], which == 1u);
+    s += w*v[a];
+  }
+  return s;
+}
+fn sampleVel(x: vec3f, which: u32) -> vec3f {
+  return vec3f(sampleComp(0u, x, which), sampleComp(1u, x, which), sampleComp(2u, x, which));
+}
+
+// 面の液体の割合。β = 1/ρ、ρ = ρ空気 + φ(1 − ρ空気) から戻す（閉じた面は0）
+fn phiOf(b: f32) -> f32 {
+  let ra = G.par.y;
+  return select(0.0, clamp((1.0/b - ra)/(1.0 - ra), 0.0, 1.0), b > 0.0);
+}
+
+// 粒子へ戻すときの補間。液体のある面だけから、液体の量で重み付けして拾う。
+// 空気だけの面を混ぜると、細い紐の粒子ほど周りの空気の速度に引き止められ、
+// 太い所だけ先に落ちて紐がしずくにちぎれる。
+// 戻り値 x = 新しい速度, y = 重力前の速度（FLIP 用）, z = 重みの合計
+fn sampleLiq(a: u32, x: vec3f) -> vec3f {
+  let g  = idx3(x) - faceOff(a);
+  let b  = vec3i(floor(g));
+  let t  = g - floor(g);
+  var s  = vec3f(0.0);
+  for (var n = 0u; n < 8u; n++) {
+    let o = vec3i(i32(n & 1u), i32((n >> 1u) & 1u), i32((n >> 2u) & 1u));
+    let c = b + o;
+    if (!inFaces(c)) { continue; }
+    let f = fid(c);
+    let w = select(1.0 - t.x, t.x, o.x == 1)*select(1.0 - t.y, t.y, o.y == 1)*select(1.0 - t.z, t.z, o.z == 1)
+          * phiOf(B[f][a]);
+    s += vec3f(w*U[f][a], w*L[f][a], w);
+  }
+  return s;
+}
+
+/* ---------- 空洞のセルを決める（最初に1回） ---------- */
+@compute @workgroup_size(64)
+fn gsInit(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  let c = ijk(f);
+  var t = 0.0;
+  if (isCell(c)) {
+    if (sdCavity(cellCenter(c)) < 0.0) { t = 1.0; }
+  }
+  L[f] = vec4f(0.0, 0.0, 0.0, t);
+  A[f] = vec4f(0.0);
+  P[f] = vec4f(0.0);
+}
+
+/* ---------- 粒子 → 格子 ---------- */
+@compute @workgroup_size(64)
+fn gsClear(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  for (var k = 0u; k < 8u; k++) { atomicStore(&acc[f*8u + k], 0); }
+}
+
+@compute @workgroup_size(64)
+fn gsP2G(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= G.dim.w) { return; }
+  let x = pos[i].xyz;
+  let v = vel[i].xyz;
+  // a = 0..2 は面の速度、a = 3 はセル中心の液体の量
+  for (var a = 0u; a < 4u; a++) {
+    let off = select(vec3f(0.5), faceOff(a), a < 3u);
+    let g = idx3(x) - off;
+    let b = vec3i(floor(g));
+    let t = g - floor(g);
+    for (var n = 0u; n < 8u; n++) {
+      let o = vec3i(i32(n & 1u), i32((n >> 1u) & 1u), i32((n >> 2u) & 1u));
+      let c = b + o;
+      if (!inFaces(c)) { continue; }
+      let w = select(1.0 - t.x, t.x, o.x == 1)*select(1.0 - t.y, t.y, o.y == 1)*select(1.0 - t.z, t.z, o.z == 1);
+      let f = fid(c)*8u;
+      if (a < 3u) {
+        atomicAdd(&acc[f + a],      i32(round(w*v[a]*SC)));
+        atomicAdd(&acc[f + 3u + a], i32(round(w*SC)));
+      } else {
+        atomicAdd(&acc[f + 6u], i32(round(w*SC)));
+      }
+    }
+  }
+}
+
+// セルの粒子の詰まり（満杯で1）。P2G の足し込みから直接読む
+fn fillAt(c: vec3i) -> f32 {
+  if (!inFaces(c)) { return 0.0; }
+  return f32(atomicLoad(&acc[fid(c)*8u + 6u]))/SC/(G.grav.w*cellVol(c));
+}
+
+/* ---------- 液体と空気をまとめ、重力を足す ---------- */
+@compute @workgroup_size(64)
+fn gsCombine(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  let c = ijk(f);
+  let rhoA = G.par.y;
+  var u  = vec3f(0.0);
+  var u0 = vec3f(0.0);
+  var be = vec3f(0.0);
+  for (var a = 0u; a < 3u; a++) {
+    if (!(fluid(c) && fluid(c - ax(a)))) { continue; }   // 壁にかかる面は閉じる
+    let wL  = f32(atomicLoad(&acc[f*8u + 3u + a]))/SC;
+    // 面のまわりの体積（面積 × 中心どうしの距離）に入る粒子の数が満杯
+    let rest = G.grav.w*faceArea(a, c)*faceDist(a, c)*G.par.w;
+    let phi = clamp(wL/rest, 0.0, 1.0);
+    var uL = 0.0;
+    if (wL > 1e-6) { uL = f32(atomicLoad(&acc[f*8u + a]))/SC/wL; }
+    let rho = rhoA + phi*(1.0 - rhoA);
+    // 運動量で混ぜる。液体が少しでもあれば液体の速度が勝つ
+    let um = (phi*uL + (1.0 - phi)*rhoA*A[f][a])/rho;
+    u0[a] = um;
+    u[a]  = um + G.grav[a]*G.par.x;
+    be[a] = 1.0/rho;
+  }
+  // 粒子の詰まり。格子の速度場は縮まなくても、粒子は補間の誤差で寄り集まる。
+  // 寄った所が重く、まばらな所が軽く扱われると、軽い列が浮いて縦のすじになる。
+  // そこで液体のセルで、詰まりすぎた所には湧き出し、まばらな所には吸い込みを
+  // 目標にして、粒子をならす。目標の合計は液体の内側だけで0にする。空気のセルに
+  // 釣り合いを持たせると、液体のわずかな詰まりの過不足が、下の部屋の空気を上へ
+  // 送り続けるポンプになる（空気の速さ1.7の噴き上げで液が穴に入れなくなった）。
+  // 液体が一様に薄まるのは phiFull を1に近く取って抑える。
+  // 均すのは液体の内側（6つの隣もすべて液体）だけ。液面のセルはいつも半端に埋まって
+  // いるので、そこにまで吸い込みを置くと、下の部屋の空気を上へ送り続けるポンプになる。
+  let fill = fillAt(c);
+  var tgt = 0.0;
+  if (fluid(c) && fill > LIQ_CELL) {
+    var inner = true;
+    for (var a = 0u; a < 3u; a++) {
+      if (!(fluid(c + ax(a)) && fillAt(c + ax(a)) > LIQ_CELL)) { inner = false; }
+      if (!(fluid(c - ax(a)) && fillAt(c - ax(a)) > LIQ_CELL)) { inner = false; }
+    }
+    if (inner) { tgt = G.ext.y*(fill - 1.0)*cellVol(c)*G.org.w/G.par.x; }
+  }
+  U[f] = vec4f(u, fill);
+  L[f] = vec4f(u0, L[f].w);
+  B[f] = vec4f(be, tgt);
+}
+
+// 目標の合計。閉じた容器では発散の合計が0でないと解けないので、目標を置いたセルの中で平均を引く。
+// 目標を置いたかどうかは B.w が0でないことで見分ける（ちょうど0の目標は平均に入らなくても差がない）
+
+@compute @workgroup_size(256)
+fn gsTgtSum(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32,
+            @builtin(workgroup_id) wg: vec3u) {
+  var t = 0.0;
+  if (gid.x < nF()) { t = B[gid.x].w; }
+  let s = wgSum(t, lid);
+  if (lid == 0u) { red[RED_PART + wg.x] = s; }
+}
+@compute @workgroup_size(256)
+fn gsTgtCnt(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32,
+            @builtin(workgroup_id) wg: vec3u) {
+  var t = 0.0;
+  if (gid.x < nF()) { t = select(0.0, 1.0, B[gid.x].w != 0.0); }
+  let s = wgSum(t, lid);
+  if (lid == 0u) { red[RED_PART + wg.x] = s; }
+}
+
+@compute @workgroup_size(256)
+fn gsRedTgt(@builtin(local_invocation_index) lid: u32) {
+  let s = partSum(lid);
+  if (lid == 0u) { red[3] = s; }
+}
+@compute @workgroup_size(256)
+fn gsRedCnt(@builtin(local_invocation_index) lid: u32) {
+  let s = partSum(lid);
+  if (lid == 0u) { red[3] = red[3]/max(s, 1.0); }
+}
+
+/* ---------- 粘性 ----------
+   (1 + α n) u − α Σ u隣 = u*（α = ν dt/dx²）をヤコビ法で解く。陰的なので α が大きくても発散しない。
+   ・液体を含む面どうしだけをつなぐ。空気の面とはつながない（空気の粘りはほぼ0。
+     液面は引っ張られない自由な面になる）
+   ・閉じた面（壁）は速度0の隣として数える。壁で滑らない条件になり、細い通路ほど流れにくい
+   ・細い紐でも、紐の中の面どうしは液体の量によらず同じ強さでつなぐ。引き伸ばしに抵抗する力も
+     紐の質量も断面積に比例するので、太さによらず同じだけ伸びにくい（しずくに切れにくい）
+   u* は U に置いたまま、反復の途中の値を P.yzw と A.xyz で受け渡す。
+   A（空気の持ち越し）は gsCombine で読んだあと gsAdvect まで使わないので空いている。 */
+const LIQ_FACE : f32 = 0.05;  // 液体を含む面とみなす割合
+
+fn viscSrc(f: u32, which: u32) -> vec3f {
+  if (which == 0u) { return U[f].xyz; }
+  if (which == 1u) { return P[f].yzw; }
+  return A[f].xyz;
+}
+fn viscOne(f: u32, which: u32) -> vec3f {
+  let c  = ijk(f);
+  let al = G.ext.x;
+  var r  = viscSrc(f, which);
+  for (var a = 0u; a < 3u; a++) {
+    let b0 = B[f][a];
+    if (b0 <= 0.0 || phiOf(b0) < LIQ_FACE) { continue; }   // 閉じた面と空気の面はそのまま
+    var sum = 0.0;
+    var n   = 0.0;
+    let xf  = facePos(a, c);
+    for (var d = 0u; d < 6u; d++) {
+      let o  = select(-ax(d % 3u), ax(d % 3u), d >= 3u);
+      let cn = c + o;
+      // 隣の面までの距離で重みを変える（細かいセルどうしほど強くつながる）
+      let dd = length(facePos(a, cn) - xf)/G.org.w;
+      let wgt = 1.0/max(dd*dd, 1e-4);
+      if (!inFaces(cn)) { n += G.ext.z*wgt; continue; }     // 外側は壁
+      let fq = fid(cn);
+      let bn = B[fq][a];
+      if (bn <= 0.0) { n += G.ext.z*wgt; continue; }        // 壁（速度0。ext.z = 0 なら滑る）
+      if (phiOf(bn) < LIQ_FACE) { continue; }               // 空気の面とはつながない
+      sum += wgt*viscSrc(fq, which)[a];
+      n   += wgt;
+    }
+    r[a] = (U[f][a] + al*sum)/(1.0 + al*n);
+  }
+  return r;
+}
+@compute @workgroup_size(64)
+fn gsVisc0(@builtin(global_invocation_id) gid: vec3u) {      // U → P.yzw
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  P[f] = vec4f(P[f].x, viscOne(f, 0u));
+}
+@compute @workgroup_size(64)
+fn gsViscPA(@builtin(global_invocation_id) gid: vec3u) {     // P.yzw → A
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  A[f] = vec4f(viscOne(f, 1u), 0.0);
+}
+@compute @workgroup_size(64)
+fn gsViscAP(@builtin(global_invocation_id) gid: vec3u) {     // A → P.yzw
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  P[f] = vec4f(P[f].x, viscOne(f, 2u));
+}
+@compute @workgroup_size(64)
+fn gsViscEnd(@builtin(global_invocation_id) gid: vec3u) {    // P.yzw → U
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  U[f] = vec4f(P[f].yzw, U[f].w);
+}
+
+/* ---------- 共役勾配法 ----------
+   (A p)_c = Σ K (p_c − p_隣)、K = β・面積/距離。右辺は −(流出 − 流入)（体積で）。
+   圧力は dt/hc を掛けた単位で持つ。
+   前処理は対角（ヤコビ）。内積はワークグループで部分和にし、1グループで合計する。 */
+var<workgroup> sh: array<f32, 256>;
+
+fn wgSum(v: f32, lid: u32) -> f32 {
+  sh[lid] = v;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) { sh[lid] += sh[lid + s]; }
+    workgroupBarrier();
+  }
+  return sh[0];
+}
+
+fn applyA(c: vec3i, comp: u32) -> f32 {
+  let f  = fid(c);
+  let pc = P[f][comp];
+  var s  = 0.0;
+  for (var a = 0u; a < 3u; a++) {
+    let bl = B[f][a];
+    if (bl > 0.0) { s += kOf(a, c, bl)*(pc - P[fid(c - ax(a))][comp]); }
+    let cr = c + ax(a);
+    if (inFaces(cr)) {
+      let br = B[fid(cr)][a];
+      if (br > 0.0) { s += kOf(a, cr, br)*(pc - P[fid(cr)][comp]); }
+    }
+  }
+  return s;
+}
+
+// 体積の出入り（面の速度 × 面積）
+fn divergence(c: vec3i) -> f32 {
+  let f = fid(c);
+  var d = 0.0;
+  for (var a = 0u; a < 3u; a++) {
+    d -= U[f][a]*faceArea(a, c);
+    let cr = c + ax(a);
+    if (inFaces(cr)) { d += U[fid(cr)][a]*faceArea(a, cr); }
+  }
+  return d;
+}
+
+// r = b − A p、z = r/diag、d = z、部分和 r·z
+@compute @workgroup_size(256)
+fn gsResid(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32,
+           @builtin(workgroup_id) wg: vec3u) {
+  let f = gid.x;
+  var rz = 0.0;
+  if (f < nF()) {
+    let c = ijk(f);
+    if (fluid(c)) {
+      var tg = 0.0;
+      if (B[f].w != 0.0) { tg = B[f].w - red[3]; }
+      let r  = -divergence(c) + tg - applyA(c, 0u);
+      let dg = diagOf(c);
+      let z  = select(0.0, r/dg, dg > 0.0);
+      P[f] = vec4f(P[f].x, r, z, 0.0);
+      rz = r*z;
+    } else {
+      P[f] = vec4f(0.0);
+    }
+  }
+  let s = wgSum(rz, lid);
+  if (lid == 0u) { red[RED_PART + wg.x] = s; }
+}
+
+fn partSum(lid: u32) -> f32 {
+  let np = (nF() + 255u)/256u;
+  var s = 0.0;
+  for (var k = lid; k < np; k += 256u) { s += red[RED_PART + k]; }
+  return wgSum(s, lid);
+}
+
+@compute @workgroup_size(256)
+fn gsRedInit(@builtin(local_invocation_index) lid: u32) {
+  let s = partSum(lid);
+  if (lid == 0u) { red[0] = s; }
+}
+
+// q = A d、部分和 d·q
+@compute @workgroup_size(256)
+fn gsApply(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32,
+           @builtin(workgroup_id) wg: vec3u) {
+  let f = gid.x;
+  var dq = 0.0;
+  if (f < nF()) {
+    let c = ijk(f);
+    if (fluid(c)) {
+      let q = applyA(c, 2u);
+      P[f].w = q;
+      dq = P[f].z*q;
+    }
+  }
+  let s = wgSum(dq, lid);
+  if (lid == 0u) { red[RED_PART + wg.x] = s; }
+}
+
+@compute @workgroup_size(256)
+fn gsRedA(@builtin(local_invocation_index) lid: u32) {
+  let s = partSum(lid);
+  if (lid == 0u) { red[1] = select(0.0, red[0]/s, abs(s) > 1e-30); }
+}
+
+// p += α d、r −= α q、z = r/diag、部分和 r·z
+@compute @workgroup_size(256)
+fn gsUpdate(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32,
+            @builtin(workgroup_id) wg: vec3u) {
+  let f = gid.x;
+  var rz = 0.0;
+  if (f < nF()) {
+    let c = ijk(f);
+    if (fluid(c)) {
+      let al = red[1];
+      var e = P[f];
+      e.x += al*e.z;
+      e.y -= al*e.w;
+      P[f] = e;
+      let dg = diagOf(c);
+      rz = e.y*select(0.0, e.y/dg, dg > 0.0);
+    }
+  }
+  let s = wgSum(rz, lid);
+  if (lid == 0u) { red[RED_PART + wg.x] = s; }
+}
+
+@compute @workgroup_size(256)
+fn gsRedB(@builtin(local_invocation_index) lid: u32) {
+  let s = partSum(lid);
+  if (lid == 0u) {
+    red[2] = select(0.0, s/red[0], abs(red[0]) > 1e-30);
+    red[0] = s;
+  }
+}
+
+// d = z + β d
+@compute @workgroup_size(256)
+fn gsDir(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  let c = ijk(f);
+  if (!fluid(c)) { return; }
+  let dg = diagOf(c);
+  let z  = select(0.0, P[f].y/dg, dg > 0.0);
+  P[f].z = z + red[2]*P[f].z;
+}
+
+/* ---------- 圧力で速度を直す ---------- */
+@compute @workgroup_size(64)
+fn gsProject(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  let c = ijk(f);
+  var u = U[f];
+  for (var a = 0u; a < 3u; a++) {
+    let b = B[f][a];
+    if (b > 0.0) { u[a] -= b*(P[f].x - P[fid(c - ax(a))].x)/faceDist(a, c); }
+  }
+  U[f] = u;
+}
+
+/* ---------- 上下の部屋の圧力差 ----------
+   2つの部屋は細い穴でしかつながっていないので、部屋どうしの圧力差は
+   共役勾配法がいちばん解きにくい成分になる。セルごとの誤差は 0.00002 ほどでも、
+   同じ向きにそろって部屋全体で積み上がり、液が下の空気を押し縮めながら落ちてしまう
+   （反復を10倍にしても単精度の限界で減らなかった）。
+   そこで上の部屋の圧力を一様にずらして、上の部屋に出入りする量の合計を0にする。
+   密閉された部屋の気圧は部屋全体で1つの値、という考えをそのまま解き方にしたもの。
+   ずらした圧力は次のステップの初期値に残るので、反復はその後の変化だけを追えばよい。 */
+fn upperCell(c: vec3i) -> bool { return f32(c.y) >= G.ext.w; }
+
+@compute @workgroup_size(256)
+fn gsChSum(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32,
+           @builtin(workgroup_id) wg: vec3u) {
+  var t = 0.0;
+  if (gid.x < nF()) {
+    let c = ijk(gid.x);
+    // 詰まりを均す目標は入れない。部屋をまたぐ体積の出入りは、目標を含めて厳密に0にする
+    if (fluid(c) && upperCell(c)) { t = divergence(c); }
+  }
+  let s = wgSum(t, lid);
+  if (lid == 0u) { red[RED_PART + wg.x] = s; }
+}
+@compute @workgroup_size(256)
+fn gsChBeta(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32,
+            @builtin(workgroup_id) wg: vec3u) {
+  var t = 0.0;
+  if (gid.x < nF()) {
+    let c = ijk(gid.x);
+    if (f32(c.y) == G.ext.w) { t = kOf(1u, c, B[gid.x].y); }
+  }
+  let s = wgSum(t, lid);
+  if (lid == 0u) { red[RED_PART + wg.x] = s; }
+}
+@compute @workgroup_size(256)
+fn gsRedCh(@builtin(local_invocation_index) lid: u32) {
+  let s = partSum(lid);
+  if (lid == 0u) { red[4] = s; }
+}
+@compute @workgroup_size(256)
+fn gsRedChB(@builtin(local_invocation_index) lid: u32) {
+  let s = partSum(lid);
+  if (lid == 0u) { red[5] = s; }
+}
+// 上の部屋の圧力を Δp ずらす。変わる速度は穴を横切る面だけ
+@compute @workgroup_size(64)
+fn gsChFix(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  let c = ijk(f);
+  if (!(fluid(c) && upperCell(c))) { return; }
+  let dp = select(0.0, -red[4]/red[5], red[5] > 1e-9);
+  P[f].x += dp;
+  if (f32(c.y) == G.ext.w && B[f].y > 0.0) { U[f].y -= B[f].y*dp/faceDist(1u, c); }
+}
+
+/* ---------- 空気の速度を移流して持ち越す ---------- */
+@compute @workgroup_size(64)
+fn gsAdvect(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  let c = ijk(f);
+  var a3 = vec3f(0.0);
+  for (var a = 0u; a < 3u; a++) {
+    if (!(fluid(c) && fluid(c - ax(a)))) { continue; }
+    let x = facePos(a, c);
+    let back = x - sampleVel(x, 0u)*G.par.x;
+    a3[a] = sampleComp(a, back, 0u);
+  }
+  A[f] = vec4f(a3, 0.0);
+}
+
+/* ---------- 格子 → 粒子 ---------- */
+@compute @workgroup_size(64)
+fn gsG2P(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= G.dim.w) { return; }
+  let x = pos[i].xyz;
+  let sx = sampleLiq(0u, x);
+  let sy = sampleLiq(1u, x);
+  let sz = sampleLiq(2u, x);
+  let wt   = max(vec3f(sx.z, sy.z, sz.z), vec3f(1e-6));
+  let pic  = vec3f(sx.x, sy.x, sz.x)/wt;
+  let old  = vec3f(sx.y, sy.y, sz.y)/wt;
+  let flip = vel[i].xyz + (pic - old);
+  vel[i] = vec4f(mix(pic, flip, G.par.z), 0.0);
+}
+
+/* ---------- 泡を描くための球 ----------
+   空気は粒子を持たないので、そのままでは液体の中の泡が描けない。
+   空気のセルの中心に描画用の球を置き、以前の空気の粒子と同じ経路で描く。
+   壁ぎわのセルは液体の粒子が壁から少し離れるぶん詰まりが低く出るので、
+   基準を下げて、壁に貼りついた偽の泡が出ないようにする。                */
+@compute @workgroup_size(64)
+fn gsAirDraw(@builtin(global_invocation_id) gid: vec3u) {
+  let g = gid.x;
+  let nc = G.dim.x*G.dim.y*G.dim.z;
+  if (g >= nc) { return; }
+  let c = vec3i(i32(g % G.dim.x), i32((g / G.dim.x) % G.dim.y), i32(g / (G.dim.x*G.dim.y)));
+  let x = cellCenter(c);
+  var air = false;
+  if (fluid(c)) {
+    let near = sdCavity(x) > -G.org.w;
+    air = U[fid(c)].w < select(AIR_CELL, AIR_CELL*0.4, near);
+  }
+  rpos[G.dim.w + g] = select(vec4f(0.0, 1e5, 0.0, 1.0), vec4f(x, 1.0), air);
+}
+
+/* ---------- 計測（調整用） ----------
+   stats[6] 重力の上側にある空気の量（セル数 ×1000）
+   stats[7] 同じく、空洞のセルの数                      */
+@compute @workgroup_size(64)
+fn gsStats(@builtin(global_invocation_id) gid: vec3u) {
+  let f = gid.x;
+  if (f >= nF()) { return; }
+  let c = ijk(f);
+  if (!fluid(c)) { return; }
+  let gl = length(G.grav.xyz);
+  if (gl < 1e-9) { return; }
+  let x = cellCenter(c);
+  if (dot(x - G.orif.xyz, -G.grav.xyz/gl) <= 0.0) { return; }
+  atomicAdd(&stats[6], u32(round((1.0 - clamp(U[f].w, 0.0, 1.0))*1000.0)));
+  atomicAdd(&stats[7], 1u);
+  // 液体の薄まり（上の部屋の液体のセルの詰まりの合計と数）。空気を格子で持つときは
+  // stats[2], [3] は空気の粒子に使わないので借りる
+  if (U[f].w > LIQ_CELL && sdCavity(x) < -G.org.w) {
+    atomicAdd(&stats[2], u32(round(U[f].w*1000.0)));
+    atomicAdd(&stats[3], 1u);
+  }
+}
+`;
+}
+
+/* ==========================================================================
+   GRAVITY — 重力ベクトル
+   ------------------------------------------------------------------------
+   チューブは画面に固定し、重力だけが回る（スマホの中にオブジェが入っている、
+   という関係）。段階1ではドラッグとキー操作のみ。センサーは段階4で足す。
+   ========================================================================== */
+
+const Gravity = (() => {
+  // 画面座標系での重力の向き（下向き）。初期は真下。
+  let gx = 0, gy = -1, gz = 0;
+  let sx = 0, sy = -1, sz = 0;        // 表示用に平滑化したもの
+
+  let tiltZ = 0, tiltX = 0;           // ドラッグ操作の傾き
+  let dragging = false, lastX = 0, lastY = 0;
+  let sensorOn = false;
+
+  const jolt = [0, 0, 0];             // 振られたときの一時的な揺さぶり
+  const lowA = [0, 0, 0];
+  let haveLow = false;
+
+  function fromTilt(){
+    const cz = Math.cos(tiltZ), sz2 = Math.sin(tiltZ);
+    const cx = Math.cos(tiltX), sx2 = Math.sin(tiltX);
+    gx =  sz2*cx;
+    gy = -cz*cx;
+    gz =  sx2;
+  }
+
+  /* ---------- センサー ---------- */
+  //
+  //   重力の向きは deviceorientation（beta / gamma）から出す。
+  //   devicemotion の accelerationIncludingGravity は iOS と Android で
+  //   符号の扱いが逆になることがあり、上下がひっくり返る。
+  //   deviceorientation は向きの定義が一つなので、その問題が起きない。
+  //   devicemotion は「振られたか」の判定にだけ使う。
+
+  let invert = false;            // 念のための手動反転
+
+  function onOrient(e){
+    if (e.beta == null || e.gamma == null) return;
+    const b = e.beta*Math.PI/180;
+    const g = e.gamma*Math.PI/180;
+
+    // 端末座標での重力（下向き）
+    //   平置き（画面が上）: beta=0, gamma=0 -> (0, 0, -1) 画面の奥へ
+    //   立てて持つ        : beta=90        -> (0, -1, 0) 画面の下へ
+    const cb = Math.cos(b);
+    let dx = -cb*Math.sin(g);
+    let dy = -Math.sin(b);
+    const dz = -cb*Math.cos(g);
+
+    // 画面の向きに合わせて回す（横持ちでも正しく効くように）
+    const ang = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+    const r = -ang*Math.PI/180;
+    const c = Math.cos(r), s2 = Math.sin(r);
+    const rx = dx*c - dy*s2;
+    const ry = dx*s2 + dy*c;
+
+    const k = invert ? -1 : 1;
+    const L = Math.hypot(rx, ry, dz) || 1;
+    gx = k*rx/L; gy = k*ry/L; gz = k*dz/L;
+    sensorOn = true;
+  }
+
+  function onMotion(e){
+    // 振られたかどうかだけを見る（重力の向きは onOrient が持つ）
+    const a = e.accelerationIncludingGravity;
+    if (!a) return;
+    const ax = a.x || 0, ay = a.y || 0, az = a.z || 0;
+    if (!haveLow) { lowA[0] = ax; lowA[1] = ay; lowA[2] = az; haveLow = true; }
+    const k = 0.10;
+    lowA[0] += (ax - lowA[0])*k; lowA[1] += (ay - lowA[1])*k; lowA[2] += (az - lowA[2])*k;
+    const dx = ax - lowA[0], dy = ay - lowA[1], dz = az - lowA[2];
+    if (Math.hypot(dx, dy, dz) > 6.5) {
+      jolt[0] += dx*0.05; jolt[1] += dy*0.05; jolt[2] += dz*0.05;
+    }
+  }
+
+  async function ask(Ev){
+    if (typeof Ev === 'undefined') return true;
+    if (typeof Ev.requestPermission !== 'function') return true;
+    try { return (await Ev.requestPermission()) === 'granted'; }
+    catch (_) { return false; }
+  }
+
+  async function enableSensors(){
+    const okO = await ask(typeof DeviceOrientationEvent !== 'undefined' ? DeviceOrientationEvent : undefined);
+    const okM = await ask(typeof DeviceMotionEvent      !== 'undefined' ? DeviceMotionEvent      : undefined);
+    if (okO) addEventListener('deviceorientation', onOrient);
+    if (okM) addEventListener('devicemotion', onMotion);
+    return okO;
+  }
+  const needsPermission = () =>
+    (typeof DeviceOrientationEvent !== 'undefined' &&
+     typeof DeviceOrientationEvent.requestPermission === 'function') ||
+    (typeof DeviceMotionEvent !== 'undefined' &&
+     typeof DeviceMotionEvent.requestPermission === 'function');
+
+  /* ---------- 代わりの操作（ドラッグ・キー） ---------- */
+
+  function uiTarget(e){
+    return e.target && e.target.closest && e.target.closest('#panel, #gear, #boot');
+  }
+  function onDown(e){
+    if (uiTarget(e)) return;
+    dragging = true; lastX = e.clientX; lastY = e.clientY;
+  }
+  function onMove(e){
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    tiltZ += dx*0.006;
+    tiltX = Math.max(-1.2, Math.min(1.2, tiltX + dy*0.006));
+    sensorOn = false;
+    fromTilt();
+  }
+  function onUp(){ dragging = false; }
+
+  addEventListener('pointerdown',   onDown, { passive:true });
+  addEventListener('pointermove',   onMove, { passive:true });
+  addEventListener('pointerup',     onUp,   { passive:true });
+  addEventListener('pointercancel', onUp,   { passive:true });
+
+  addEventListener('keydown', (e) => {
+    const step = 0.12;
+    if (e.key === 'ArrowLeft')  { tiltZ -= step; sensorOn = false; fromTilt(); }
+    if (e.key === 'ArrowRight') { tiltZ += step; sensorOn = false; fromTilt(); }
+    if (e.key === 'ArrowUp')    { tiltX = Math.max(-1.2, tiltX - step); sensorOn = false; fromTilt(); }
+    if (e.key === 'ArrowDown')  { tiltX = Math.min( 1.2, tiltX + step); sensorOn = false; fromTilt(); }
+    if (e.key === ' ' || e.code === 'Space') { flip(); e.preventDefault(); }
+  });
+
+  /* ---------- ひっくり返す ---------- */
+
+  let flipT = 0, flipping = false, flipFrom = 0;
+  function flip(){
+    if (flipping) return;
+    flipping = true; flipT = 0; flipFrom = tiltZ;
+    sensorOn = false;
+  }
+
+  function update(dt){
+    if (flipping) {
+      flipT = Math.min(1, flipT + dt/0.75);
+      const e = flipT < 0.5 ? 2*flipT*flipT : 1 - 2*(1 - flipT)*(1 - flipT);
+      tiltZ = flipFrom + Math.PI*e;
+      fromTilt();
+      if (flipT >= 1) { flipping = false; tiltZ = ((tiltZ + Math.PI)%(2*Math.PI)) - Math.PI; }
+    }
+    // 平滑化（時定数 80ms 相当）。手ブレは消え、意図的な反転には素早く追従する。
+    const a = 1 - Math.exp(-dt/0.08);
+    sx += (gx - sx)*a;  sy += (gy - sy)*a;  sz += (gz - sz)*a;
+    const l = Math.hypot(sx, sy, sz) || 1;
+    sx /= l; sy /= l; sz /= l;
+
+    const d = Math.exp(-dt/0.35);
+    jolt[0] *= d; jolt[1] *= d; jolt[2] *= d;
+  }
+
+  return {
+    update, flip, enableSensors, needsPermission,
+    get inverted(){ return invert; },
+    set inverted(v){ invert = !!v; },
+    get on(){ return sensorOn; },
+    get down(){ return [sx, sy, sz]; },
+    get up(){ return [-sx, -sy, -sz]; },
+    get jolt(){ return jolt; },
+  };
+})();
+
+/* ==========================================================================
+   WGSL — シェーダ
+   ========================================================================== */
+
+// --- 全画面三角形 + 共通の定義 ---
+const WGSL_COMMON = `
+struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vsFull(@builtin(vertex_index) vi: u32) -> VO {
+  var P = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  var o: VO;
+  o.pos = vec4f(P[vi], 0.0, 1.0);
+  o.uv  = P[vi]*0.5 + vec2f(0.5, 0.5);
+  return o;
+}
+
+// キューブマップの面番号と uv から方向を得る（+X -X +Y -Y +Z -Z）
+fn dirFromFace(face: u32, uv: vec2f) -> vec3f {
+  let a = uv.x*2.0 - 1.0;
+  let b = uv.y*2.0 - 1.0;
+  switch (face) {
+    case 0u: { return normalize(vec3f( 1.0, -b, -a)); }
+    case 1u: { return normalize(vec3f(-1.0, -b,  a)); }
+    case 2u: { return normalize(vec3f( a,  1.0,  b)); }
+    case 3u: { return normalize(vec3f( a, -1.0, -b)); }
+    case 4u: { return normalize(vec3f( a, -b,  1.0)); }
+    default: { return normalize(vec3f(-a, -b, -1.0)); }
+  }
+}
+`;
+
+// --- 全パイプラインで共通のユニフォーム ---
+const WGSL_UNI = `
+struct Uni {
+  view     : mat4x4f, // 世界 -> ビュー
+  proj     : mat4x4f, // ビュー -> クリップ
+  viewProj : mat4x4f, // 世界 -> クリップ（w が視線方向の深度になる）
+  camRight : vec4f,   // xyz = カメラ右, w = tan(縦画角/2)
+  camUp    : vec4f,   // xyz = カメラ上, w = アスペクト比
+  camFwd   : vec4f,   // xyz = カメラ前
+  camPos   : vec4f,   // xyz = カメラ位置, w = 時刻
+  grav     : vec4f,   // xyz = 重力の逆向き
+  liqA     : vec4f,   // rgb = 液体に残る色, a = 吸収の強さ
+  glsA     : vec4f,   // rgb = ガラスに残る色, a = 吸収の強さ
+  mat      : vec4f,   // x = ガラス屈折率, y = 液体屈折率, z = ガラス粗さ, w = 露出
+  res      : vec4f,   // xy = 解像度, zw = 1/解像度
+  bnd      : vec4f,   // x = 境界円筒の半径, y = 同 半高, z = ミップ最大, w = 背景の明るさ
+  fluid    : vec4f,   // x = 粒子の表示半径, y = 厚み係数, z = 平滑化半径(流体画素), w = 遠方値
+  fres     : vec4f,   // xy = 流体バッファの解像度, zw = その逆数
+};
+@group(0) @binding(0) var<uniform> U: Uni;
+`;
+
+// --- 環境マップの手続き生成 ---
+const WGSL_ENVGEN = WGSL_COMMON + `
+struct EnvU { face: u32, preset: u32, lobe: f32, pad: f32 };
+@group(0) @binding(0) var<uniform> E: EnvU;
+
+// 原点から見たソフトボックス（矩形の面光源）のマスク
+fn softbox(d: vec3f, C: vec3f, hu: f32, hv: f32, soft: f32) -> f32 {
+  let n  = normalize(-C);
+  let dn = dot(d, n);
+  if (dn > -1e-4) { return 0.0; }
+  let t = dot(C, n)/dn;
+  if (t <= 0.0) { return 0.0; }
+  let w = d*t - C;
+  var u = cross(n, vec3f(0.0, 1.0, 0.0));
+  if (length(u) < 1e-3) { u = cross(n, vec3f(1.0, 0.0, 0.0)); }
+  u = normalize(u);
+  let v = normalize(cross(u, n));
+  let a = abs(dot(w, u));
+  let b = abs(dot(w, v));
+  let ma = 1.0 - smoothstep(hu*(1.0 - soft), hu, a);
+  let mb = 1.0 - smoothstep(hv*(1.0 - soft), hv, b);
+  return ma*mb;
+}
+
+// 床（高さ -1.55 の面）。真下に柔らかい影を落とす。
+fn floorCol(d: vec3f, near: vec3f, far: vec3f, shadow: f32) -> vec3f {
+  let t = -1.12/d.y;
+  let p = d*t;
+  let r = length(p.xz);
+  var fl = mix(near, far, smoothstep(0.35, 5.0, r));
+  fl *= mix(shadow, 1.0, smoothstep(0.15, 1.05, r));
+  return fl;
+}
+
+// --- 景色 ---
+//   容器が画面の大半を覆うので、見えているものはほぼ「容器ごしの環境マップ」になる。
+//   なめらかなグラデーションだけだと屈折させても変化が見えないので、
+//   輪郭の硬い光源・細い縦のストリップ・床と壁の境目を入れる。
+//   細いストリップは屈折すると線として曲がるので、液面や泡の形が一番よく分かる。
+
+fn envStudio(d: vec3f) -> vec3f {
+  // 背景の壁（上へ向かって暗く）
+  var c = mix(vec3f(0.058, 0.065, 0.082), vec3f(0.014, 0.016, 0.022),
+              smoothstep(0.0, 0.8, d.y));
+
+  // 床。壁との境目ははっきり出す。
+  if (d.y < -0.004) {
+    let t = -1.12/d.y;
+    let p = d*t;
+    let r = length(p.xz);
+    var fl = mix(vec3f(0.125, 0.132, 0.148), vec3f(0.011, 0.013, 0.018),
+                 smoothstep(0.35, 4.2, r));
+    fl *= mix(0.10, 1.0, smoothstep(0.10, 0.90, r));      // 接地の影
+    c = mix(c, fl, smoothstep(-0.004, -0.018, d.y));      // 境目を硬く
+  }
+
+  c += softbox(d, vec3f(-2.3,  2.6,  2.0), 1.55, 1.15, 0.05) * vec3f(8.5, 8.6, 9.0);
+  c += softbox(d, vec3f( 2.9,  0.7,  1.9), 0.11, 1.70, 0.10) * vec3f(7.0, 7.2, 8.0);
+  c += softbox(d, vec3f( 2.2, -0.5, -2.2), 0.09, 1.30, 0.12) * vec3f(3.2, 3.3, 3.9);
+  c += softbox(d, vec3f(-2.6, -0.2, -1.6), 0.08, 1.10, 0.12) * vec3f(2.2, 2.3, 2.8);
+  c += softbox(d, vec3f(-0.4,  0.8, -3.2), 2.40, 2.00, 0.12) * vec3f(0.30, 0.32, 0.38);
+  return c;
+}
+
+fn envRoom(d: vec3f) -> vec3f {
+  var c = mix(vec3f(0.095, 0.086, 0.074), vec3f(0.022, 0.020, 0.018),
+              smoothstep(0.0, 0.8, d.y));
+  if (d.y < -0.004) {
+    let t = -1.12/d.y;
+    let p = d*t;
+    let r = length(p.xz);
+    var fl = mix(vec3f(0.165, 0.118, 0.078), vec3f(0.018, 0.013, 0.010),
+                 smoothstep(0.35, 4.2, r));
+    fl *= mix(0.10, 1.0, smoothstep(0.10, 0.90, r));
+    c = mix(c, fl, smoothstep(-0.004, -0.018, d.y));
+  }
+  // 窓（桟で3枚に割る。屈折すると縦線が曲がって見える）
+  c += softbox(d, vec3f(-2.9, 1.3, 1.9), 0.26, 1.55, 0.03) * vec3f(6.5, 7.0, 8.4);
+  c += softbox(d, vec3f(-2.9, 1.3, 0.1), 0.26, 1.55, 0.03) * vec3f(6.5, 7.0, 8.4);
+  // 室内灯（暖色）
+  c += softbox(d, vec3f( 0.8, 3.1, -0.6), 0.45, 0.45, 0.10) * vec3f(5.5, 4.2, 2.7);
+  c += softbox(d, vec3f( 2.6, 0.2, -1.8), 0.08, 1.00, 0.06) * vec3f(2.0, 1.7, 1.3);
+  return c;
+}
+
+fn envSunset(d: vec3f) -> vec3f {
+  let h = clamp(d.y, -1.0, 1.0);
+  var c = mix(vec3f(0.46, 0.21, 0.13), vec3f(0.035, 0.045, 0.100),
+              smoothstep(-0.02, 0.70, h));
+  // 水平線をはっきり出す
+  c = mix(c, vec3f(0.78, 0.40, 0.20), smoothstep(0.06, 0.0, abs(h))*0.85);
+  if (d.y < -0.004) {
+    let t = -1.12/d.y;
+    let p = d*t;
+    let r = length(p.xz);
+    var fl = mix(vec3f(0.115, 0.078, 0.058), vec3f(0.016, 0.013, 0.016),
+                 smoothstep(0.35, 4.2, r));
+    fl *= mix(0.12, 1.0, smoothstep(0.10, 0.90, r));
+    c = mix(c, fl, smoothstep(-0.004, -0.018, d.y));
+  }
+  // 低い太陽（輪郭を硬く）
+  let sun = normalize(vec3f(-0.72, 0.10, 0.68));
+  let ca  = dot(d, sun);
+  c += vec3f(20.0, 9.0, 3.6) * smoothstep(0.9988, 0.9994, ca);
+  c += vec3f(0.85, 0.36, 0.16) * pow(max(ca, 0.0), 40.0);
+  c += softbox(d, vec3f( 2.6, 0.6, -1.9), 0.09, 1.20, 0.05) * vec3f(1.6, 1.2, 1.0);
+  return c;
+}
+
+@fragment fn fsEnv(i: VO) -> @location(0) vec4f {
+  let d = dirFromFace(E.face, i.uv);
+  var c: vec3f;
+  switch (E.preset) {
+    case 1u:  { c = envRoom(d); }
+    case 2u:  { c = envSunset(d); }
+    default:  { c = envStudio(d); }
+  }
+  return vec4f(c, 1.0);
+}
+`;
+
+// --- 環境マップのプリフィルタ（ラフネス反射用のミップ） ---
+const WGSL_ENVBLUR = WGSL_COMMON + `
+struct EnvU { face: u32, preset: u32, lobe: f32, pad: f32 };
+@group(0) @binding(0) var<uniform> E: EnvU;
+@group(0) @binding(1) var srcTex: texture_cube<f32>;
+@group(0) @binding(2) var smp: sampler;
+
+@fragment fn fsBlur(i: VO) -> @location(0) vec4f {
+  let n = dirFromFace(E.face, i.uv);
+  var t = cross(n, vec3f(0.0, 1.0, 0.0));
+  if (length(t) < 1e-3) { t = cross(n, vec3f(1.0, 0.0, 0.0)); }
+  t = normalize(t);
+  let b = cross(n, t);
+
+  var acc = vec3f(0.0);
+  var wsum = 0.0;
+  const N = 28;
+  for (var k = 0; k < N; k++) {
+    let fk = (f32(k) + 0.5)/f32(N);
+    let r  = sqrt(fk)*E.lobe;
+    let a  = f32(k)*2.39996323;
+    let dir = normalize(n + (t*cos(a) + b*sin(a))*tan(min(r, 1.45)));
+    let w = cos(r);
+    acc  += textureSampleLevel(srcTex, smp, dir, 0.0).rgb * w;
+    wsum += w;
+  }
+  return vec4f(acc/max(wsum, 1e-5), 1.0);
+}
+`;
+
+// --- 本体: ガラス・空気・液体を統一的に扱うレイマーチャ ---
+//
+//   3つの媒質（ガラス / 空洞の空気 / 液体）を符号付き距離関数で表し、
+//   界面に当たるたびにフレネルで反射と屈折に分け、
+//   媒質の中を進んだ距離に応じて Beer-Lambert で吸収をかける。
+//   反射側は環境キューブマップで打ち切る（単体のオブジェでは十分）。
+//   全反射のときは同じ媒質の中で反射させてそのまま追跡を続ける。
+//
+function buildMainWGSL(shape){
+  const shapeSrc = buildShapeSource(shape, 'wgsl');
+  const M = CONFIG.march;
+  return WGSL_COMMON + `
+${WGSL_UNI}
+@group(0) @binding(1) var envTex: texture_cube<f32>;
+@group(0) @binding(2) var smp: sampler;
+@group(0) @binding(3) var liqDepth: texture_2d<f32>;
+@group(0) @binding(4) var liqThick: texture_2d<f32>;
+@group(0) @binding(5) var gasDepth: texture_2d<f32>;
+@group(0) @binding(6) var gasThick: texture_2d<f32>;
+
+const EPS   : f32 = ${f(M.eps)};
+const NEPS  : f32 = ${f(M.normalEps)};
+const SEGMAX: f32 = 9.0;
+const MARCH : i32 = ${M.cavity};
+const MAXSEG: i32 = 6;
+
+const MED_OUT   : i32 = 0;
+const MED_GLASS : i32 = 1;
+const MED_AIR   : i32 = 2;
+const MED_LIQ   : i32 = 3;
+
+${SDF_LIB_WGSL}
+${shapeSrc}
+
+// --- 液体は画面空間で表す ---
+// 粒子を球として描いた深度（前面）と厚みから、液体を「深度方向のスラブ」とみなす。
+// 視線から少しずれたレイでも、投影しなおして同じ表を引けるので、
+// 屈折したレイの追跡をそのまま続けられる。
+fn projUV(p: vec3f) -> vec3f {           // xy = uv(y上), z = ビュー深度
+  let c = U.viewProj*vec4f(p, 1.0);
+  if (c.w <= 1e-6) { return vec3f(-1.0, -1.0, -1.0); }
+  return vec3f(c.xy/c.w*0.5 + vec2f(0.5, 0.5), c.w);
+}
+fn texel(uv: vec2f) -> vec2i {
+  let r = U.fres.xy;
+  return vec2i(clamp(vec2f(uv.x, 1.0 - uv.y)*r, vec2f(0.0), r - vec2f(1.0)));
+}
+// 相ごとの「前面の深度」と「厚み」。厚みは半解像度で線形に読むので段差が出ない。
+fn liqAtUV(uv: vec2f) -> vec2f {
+  return vec2f(textureLoad(liqDepth, texel(uv), 0).r,
+               textureSampleLevel(liqThick, smp, vec2f(uv.x, 1.0 - uv.y), 0.0).r);
+}
+fn gasAtUV(uv: vec2f) -> vec2f {
+  return vec2f(textureLoad(gasDepth, texel(uv), 0).r,
+               textureSampleLevel(gasThick, smp, vec2f(uv.x, 1.0 - uv.y), 0.0).r);
+}
+// 視線方向の距離なので、斜めの面で踏み越えないよう安全側に縮める。
+// zb を渡すことで、スラブの奥側を手前の相の手前で打ち切れる。
+fn slabDist(zf: f32, zb: f32, z: f32) -> f32 {
+  return max(zf - z, z - zb)*0.45;
+}
+
+fn viewPosAt(uv: vec2f, z: f32) -> vec3f {
+  let ndc = uv*2.0 - vec2f(1.0, 1.0);
+  return vec3f(ndc.x*U.camRight.w*U.camUp.w*z, ndc.y*U.camRight.w*z, -z);
+}
+fn toWorldN(n: vec3f) -> vec3f {
+  return normalize(U.camRight.xyz*n.x + U.camUp.xyz*n.y - U.camFwd.xyz*n.z);
+}
+// 深度の差分から面の法線を起こす。前後どちらか近いほうの差分を採って輪郭を保つ。
+fn normalFromDepth(q: vec3f, isGas: bool) -> vec3f {
+  // 1画素の差分だと粒ひとつぶんの膨らみがそのまま法線に出て、
+  // つながった液体ではなく玉の集まりに見えてしまう。
+  // 粒の見かけの大きさに合わせて差分の幅を広げ、面として均す。
+  let e = U.fres.zw*max(U.fluid.z*0.60, 2.0);
+  var z   = 0.0; var zx1 = 0.0; var zx0 = 0.0; var zy1 = 0.0; var zy0 = 0.0;
+  if (isGas) {
+    z   = gasAtUV(q.xy).x;
+    zx1 = gasAtUV(q.xy + vec2f(e.x, 0.0)).x;
+    zx0 = gasAtUV(q.xy - vec2f(e.x, 0.0)).x;
+    zy1 = gasAtUV(q.xy + vec2f(0.0, e.y)).x;
+    zy0 = gasAtUV(q.xy - vec2f(0.0, e.y)).x;
+  } else {
+    z   = liqAtUV(q.xy).x;
+    zx1 = liqAtUV(q.xy + vec2f(e.x, 0.0)).x;
+    zx0 = liqAtUV(q.xy - vec2f(e.x, 0.0)).x;
+    zy1 = liqAtUV(q.xy + vec2f(0.0, e.y)).x;
+    zy0 = liqAtUV(q.xy - vec2f(0.0, e.y)).x;
+  }
+  let P  = viewPosAt(q.xy, z);
+  var dx = viewPosAt(q.xy + vec2f(e.x, 0.0), zx1) - P;
+  if (abs(zx0 - z) < abs(zx1 - z)) { dx = P - viewPosAt(q.xy - vec2f(e.x, 0.0), zx0); }
+  var dy = viewPosAt(q.xy + vec2f(0.0, e.y), zy1) - P;
+  if (abs(zy0 - z) < abs(zy1 - z)) { dy = P - viewPosAt(q.xy - vec2f(0.0, e.y), zy0); }
+  var n = cross(dx, dy);
+  let l = length(n);
+  if (l < 1e-12) { return -U.camFwd.xyz; }
+  n = n/l;
+  if (n.z < 0.0) { n = -n; }
+  return toWorldN(n);
+}
+
+// body = 容器, liq = 液体（空気をくり抜いたもの）, cav = 空洞,
+// liqS = 液体のスラブ, gasS = 空気のスラブ
+struct FD { body: f32, liq: f32, cav: f32, liqS: f32, gasS: f32 };
+
+fn fields(p: vec3f) -> FD {
+  var f: FD;
+  let o = sdOuter(p);
+  let c = sdCavity(p);
+  f.cav  = c;
+  f.body = max(o, -c);
+  // 空洞の外に中身はないので、重い画面空間の判定を省く
+  if (c > 0.0) { f.liqS = 1.0; f.gasS = 1.0; f.liq = c; return f; }
+
+  let q = projUV(p);
+  var liqS = 1.0;
+  var gasS = 1.0;
+  if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
+    let L = liqAtUV(q.xy);
+    let G = gasAtUV(q.xy);
+    let hasL = L.x < U.fluid.w*0.5;
+    let hasG = G.x < U.fluid.w*0.5;
+    // 薄いところでも最低限の奥行きを持たせる（薄すぎると点滅する）
+    let tmin = U.fluid.x*1.8;
+    if (hasL) { liqS = slabDist(L.x, L.x + max(L.y, tmin), q.z); }
+    if (hasG) {
+      var zb = G.x + max(G.y, tmin);
+      // 気体より奥から液体が始まるなら、気体はそこで終わる。
+      // ここを打ち切らないと、気体の中を落ちる細い筋が気体に覆い隠されて
+      // 見えなくなる（液体がワープして見える原因）。
+      if (hasL && L.x > G.x) { zb = min(zb, L.x); }
+      gasS = slabDist(G.x, zb, q.z);
+    }
+  }
+  f.liqS = liqS;
+  f.gasS = gasS;
+  // 液体 = 空洞 ∩ 液体スラブ ∩ ¬空気スラブ
+  f.liq  = max(max(c, liqS), -gasS);
+  return f;
+}
+fn ifaceDist(p: vec3f) -> f32 {
+  let f = fields(p);
+  return min(abs(f.body), abs(f.liq));
+}
+fn mediumOf(f: FD) -> i32 {
+  if (f.body < 0.0) { return MED_GLASS; }
+  if (f.cav  < 0.0) {
+    if (f.liq < 0.0) { return MED_LIQ; }
+    return MED_AIR;
+  }
+  return MED_OUT;
+}
+fn mediumAt(p: vec3f) -> i32 { return mediumOf(fields(p)); }
+fn iorOf(m: i32) -> f32 {
+  if (m == MED_GLASS) { return U.mat.x; }
+  if (m == MED_LIQ)   { return U.mat.y; }
+  return 1.0;
+}
+
+// 4点法による勾配
+fn gradBody(p: vec3f) -> vec3f {
+  let e = NEPS;
+  let d1 = sdBody(p + vec3f( e, -e, -e));
+  let d2 = sdBody(p + vec3f(-e, -e,  e));
+  let d3 = sdBody(p + vec3f(-e,  e, -e));
+  let d4 = sdBody(p + vec3f( e,  e,  e));
+  return normalize(vec3f(d4 + d1 - d2 - d3, d4 - d1 - d2 + d3, d4 - d1 + d2 - d3));
+}
+fn gradCav(p: vec3f) -> vec3f {
+  let e = NEPS;
+  let d1 = sdCavity(p + vec3f( e, -e, -e));
+  let d2 = sdCavity(p + vec3f(-e, -e,  e));
+  let d3 = sdCavity(p + vec3f(-e,  e, -e));
+  let d4 = sdCavity(p + vec3f( e,  e,  e));
+  return normalize(vec3f(d4 + d1 - d2 - d3, d4 - d1 - d2 + d3, d4 - d1 + d2 - d3));
+}
+
+fn envS(d: vec3f, mip: f32) -> vec3f {
+  return textureSampleLevel(envTex, smp, d, clamp(mip, 0.0, U.bnd.z)).rgb;
+}
+
+// 直接見える背景。照明用の環境マップとは別に作る。
+// 環境マップは反射と透過のために明るくしておき、背景だけを落ち着いた暗さにすると、
+// 暗い背景の中でオブジェだけが光を通して見える（撮影スタジオと同じ考え方）。
+fn bgColor(d: vec3f) -> vec3f {
+  let h = clamp(d.y*0.5 + 0.5, 0.0, 1.0);
+  var c = mix(vec3f(0.017, 0.020, 0.027), vec3f(0.052, 0.059, 0.076), smoothstep(0.28, 1.0, h));
+  if (d.y < -0.004) {
+    let t = -1.12/d.y;
+    let p = d*t;
+    let r = length(p.xz);
+    var fl = mix(vec3f(0.082, 0.088, 0.100), vec3f(0.014, 0.016, 0.022), smoothstep(0.35, 5.0, r));
+    fl *= mix(0.14, 1.0, smoothstep(0.13, 1.05, r));    // 接地の影
+    c = mix(c, fl, smoothstep(-0.004, -0.055, d.y));
+  }
+  return c;
+}
+fn f0of(n1: f32, n2: f32) -> f32 { let r = (n1 - n2)/(n1 + n2); return r*r; }
+fn fres(f0: f32, c: f32) -> f32 {
+  let m = clamp(1.0 - c, 0.0, 1.0);
+  return f0 + (1.0 - f0)*pow(m, 5.0);
+}
+
+// 軸が y の円筒との交差。見つからなければ x に負値。
+fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
+  var t0 = -1e9;
+  var t1 =  1e9;
+  let a = dot(rd.xz, rd.xz);
+  let b = dot(ro.xz, rd.xz);
+  let c = dot(ro.xz, ro.xz) - R*R;
+  if (a > 1e-9) {
+    let disc = b*b - a*c;
+    if (disc < 0.0) { return vec2f(-1.0, -1.0); }
+    let s = sqrt(disc);
+    t0 = (-b - s)/a;
+    t1 = (-b + s)/a;
+  } else if (c > 0.0) {
+    return vec2f(-1.0, -1.0);
+  }
+  if (abs(rd.y) > 1e-9) {
+    let ta = (-H - ro.y)/rd.y;
+    let tb = ( H - ro.y)/rd.y;
+    t0 = max(t0, min(ta, tb));
+    t1 = min(t1, max(ta, tb));
+  } else if (abs(ro.y) > H) {
+    return vec2f(-1.0, -1.0);
+  }
+  if (t1 < max(t0, 0.0)) { return vec2f(-1.0, -1.0); }
+  return vec2f(max(t0, 0.0), t1);
+}
+
+@fragment fn fsMain(i: VO) -> @location(0) vec4f {
+  // 確認用: 相を色分けして見る（?view=phase）。屈折を通さないので物理だけを見られる。
+  if (U.camFwd.w > 0.5) {
+    let L = liqAtUV(i.uv);
+    let G = gasAtUV(i.uv);
+    // 厚みを足し合わせるので、液体の中にある泡も見える
+    var tl = select(0.0, min(L.y*1.9, 1.3), L.x < U.fluid.w*0.5);
+    var tg = select(0.0, min(G.y*1.9, 1.3), G.x < U.fluid.w*0.5);
+    if (U.camFwd.w > 2.5) { tg = 0.0; }        // 液相だけ
+    else if (U.camFwd.w > 1.5) { tl = 0.0; }   // 気相だけ
+    let c = vec3f(0.015, 0.018, 0.028)
+          + vec3f(0.07, 0.33, 0.95)*tl
+          + vec3f(1.00, 0.46, 0.06)*tg;
+    return vec4f(c, 1.0);
+  }
+
+  let ndc = i.uv*2.0 - vec2f(1.0, 1.0);
+  let rd0 = normalize(U.camFwd.xyz
+          + U.camRight.xyz*(ndc.x*U.camRight.w*U.camUp.w)
+          + U.camUp.xyz   *(ndc.y*U.camRight.w));
+  let ro  = U.camPos.xyz;
+
+  let hb = hitCyl(ro, rd0, U.bnd.x, U.bnd.y);
+  if (hb.x < 0.0) {
+    return vec4f(bgColor(rd0)*U.bnd.w, 1.0);
+  }
+
+  var pos = ro + rd0*max(hb.x - 0.004, 0.0);
+  var dir = rd0;
+  var med = mediumAt(pos);
+  var thr = vec3f(1.0, 1.0, 1.0);
+  var rad = vec3f(0.0, 0.0, 0.0);
+  var settled = false;
+  // すれすれの角度で屈折したレイは大きく広がる。そのぶん環境マップを
+  // ぼかして拾わないと、細い光源を拾って壁ぎわがギラつく。
+  var spread = 0.0;
+
+  let gExt = U.glsA.a*(vec3f(1.0, 1.0, 1.0) - U.glsA.rgb);
+  let lExt = U.liqA.a*(vec3f(1.0, 1.0, 1.0) - U.liqA.rgb);
+
+  for (var seg = 0; seg < MAXSEG; seg++) {
+    // --- 今いる媒質の中を、次の界面まで進む ---
+    var t = 0.0;
+    var hit = false;
+    for (var s = 0; s < MARCH; s++) {
+      let d = ifaceDist(pos + dir*t);
+      if (d < EPS) { hit = true; break; }
+      t += max(d, EPS*0.8);
+      if (t > SEGMAX) { break; }
+    }
+    if (med == MED_GLASS)    { thr *= exp(-gExt*t); }
+    else if (med == MED_LIQ) { thr *= exp(-lExt*t); }
+
+    if (!hit) {
+      if (med == MED_OUT) { rad += thr*bgColor(dir)*U.bnd.w; }
+      else                { rad += thr*envS(dir, spread*U.bnd.z); }
+      settled = true;
+      break;
+    }
+    pos = pos + dir*t;
+
+    // --- 界面の法線（ガラス面か液面か、近いほうを採る） ---
+    // liq = max(cav, liqS, -gasS) のうち、どの面が効いているかで法線を選ぶ
+    let f = fields(pos);
+    var nrm: vec3f;
+    if (abs(f.body) <= abs(f.liq)) {
+      nrm = gradBody(pos);                              // 容器の内壁
+    } else if (f.cav > -U.fluid.x*1.6) {
+      // 壁のすぐそばは必ず壁の法線を使う。画素ごとに壁と液面の法線が
+      // 切り替わると、壁ぎわに縦縞が出てしまう。
+      nrm = gradCav(pos);
+    } else if (-f.gasS >= f.liqS) {
+      nrm = normalFromDepth(projUV(pos), true);         // 泡の面
+    } else {
+      nrm = normalFromDepth(projUV(pos), false);        // 液体の自由表面
+    }
+    if (dot(nrm, dir) > 0.0) { nrm = -nrm; }
+
+    let medNext = mediumAt(pos + dir*(EPS*4.0));
+    if (medNext == med) {
+      // 界面をかすめただけ。少し進めて続行する
+      pos = pos + dir*(EPS*4.0);
+      continue;
+    }
+
+    let n1   = iorOf(med);
+    let n2   = iorOf(medNext);
+    let cosi = max(dot(-dir, nrm), 0.0);
+    let eta  = n1/n2;
+    let kk   = 1.0 - eta*eta*(1.0 - cosi*cosi);
+
+    if (kk < 0.0) {
+      // 全反射。同じ媒質の中で反射して追跡を続ける
+      dir = reflect(dir, nrm);
+      pos = pos + dir*(EPS*4.0);
+      continue;
+    }
+
+    let rough = select(0.0, U.mat.z, med == MED_GLASS || medNext == MED_GLASS);
+    let F = fres(f0of(n1, n2), cosi);
+    rad += thr*F*envS(reflect(dir, nrm), max(rough*1.6, spread*0.6)*U.bnd.z);
+    thr *= (1.0 - F);
+    // 入射が浅いほどレイは広がる
+    spread = min(spread + (1.0 - cosi)*0.55, 1.0);
+
+    dir = normalize(eta*dir + (eta*cosi - sqrt(kk))*nrm);
+    pos = pos + dir*(EPS*4.0);
+    med = medNext;
+
+    if (med == MED_OUT) {
+      // 物体を抜けて背景へ。透過光は明るい環境マップから拾う
+      rad += thr*envS(dir, spread*U.bnd.z);
+      settled = true;
+      break;
+    }
+    if (max(thr.r, max(thr.g, thr.b)) < 0.004) { settled = true; break; }
+  }
+  if (!settled) { rad += thr*envS(dir, max(spread, 0.3)*U.bnd.z)*0.7; }
+  return vec4f(rad, 1.0);
+}
+`;
+}
+
+// --- トーンマップ ---
+const WGSL_POST = WGSL_COMMON + `
+` + WGSL_UNI + `
+@group(0) @binding(1) var hdrTex: texture_2d<f32>;
+@group(0) @binding(2) var smp: sampler;
+
+fn aces(x: vec3f) -> vec3f {
+  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+  return clamp((x*(a*x + vec3f(b)))/(x*(c*x + vec3f(d)) + vec3f(e)), vec3f(0.0), vec3f(1.0));
+}
+
+@fragment fn fsPost(i: VO) -> @location(0) vec4f {
+  var c = textureSampleLevel(hdrTex, smp, vec2f(i.uv.x, 1.0 - i.uv.y), 0.0).rgb;
+  c = aces(c*U.mat.w);
+  let q = (i.uv - vec2f(0.5, 0.5))*vec2f(U.camUp.w, 1.0);
+  c *= 1.0 - 0.20*dot(q, q);
+  c = pow(max(c, vec3f(0.0)), vec3f(1.0/2.2));
+  let n = fract(sin(dot(i.pos.xy, vec2f(12.9898, 78.233)))*43758.5453);
+  c += vec3f((n - 0.5)/255.0);
+  return vec4f(c, 1.0);
+}
+`;
+
+// --- 粒子を球として描く（液面の深度と厚み） ---
+const WGSL_PART = WGSL_COMMON + WGSL_UNI + `
+@group(0) @binding(1) var<storage, read> parts: array<vec4f>;
+
+struct PO {
+  @builtin(position) pos : vec4f,
+  @location(0)       uv  : vec2f,   // 球の断面上の位置 (-1..1)
+  @location(1)       vc  : vec3f,   // ビュー空間の中心
+};
+
+@vertex fn vsPart(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PO {
+  var Q = array<vec2f, 6>(
+    vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
+    vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0));
+  let q  = Q[vi];
+  let r  = U.fluid.x;
+  let vc = (U.view*vec4f(parts[ii].xyz, 1.0)).xyz;
+  var o: PO;
+  o.pos = U.proj*vec4f(vc + vec3f(q*r, 0.0), 1.0);
+  o.uv  = q;
+  o.vc  = vc;
+  return o;
+}
+
+struct DO { @location(0) d: f32, @builtin(frag_depth) z: f32 };
+
+@fragment fn fsPartDepth(i: PO) -> DO {
+  let d2 = dot(i.uv, i.uv);
+  if (d2 > 1.0) { discard; }
+  let r  = U.fluid.x;
+  let vp = i.vc + vec3f(i.uv*r, sqrt(1.0 - d2)*r);
+  let c  = U.proj*vec4f(vp, 1.0);
+  var o: DO;
+  o.d = -vp.z;
+  o.z = c.z/c.w;
+  return o;
+}
+
+@fragment fn fsPartThick(i: PO) -> @location(0) f32 {
+  let d2 = dot(i.uv, i.uv);
+  if (d2 > 1.0) { discard; }
+  return 2.0*U.fluid.x*sqrt(1.0 - d2)*U.fluid.y;
+}
+`;
+
+// --- 深度の平滑化（分離2パスの双方向フィルタ）---
+//   球のつぶつぶを消して滑らかな液面にする。深度が大きく離れた画素は
+//   重みを落とすので、輪郭がぼやけて溶けることはない。
+const WGSL_SMOOTH = WGSL_COMMON + WGSL_UNI + `
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+// narrow-range filter（Truong ら）
+//   中心の深度から一定の幅の外に出たサンプルは「捨てる」のではなく「端に丸める」。
+//   捨てると縁で重みが偏って輪郭が溶けるが、丸めると平均が端に寄るだけなので
+//   粒のでこぼこだけ消えて輪郭は立ったまま残る。
+fn smoothDir(fc: vec2f, dir: vec2i) -> f32 {
+  let res = vec2i(U.fres.xy);
+  let t0  = vec2i(floor(fc));
+  let z0  = textureLoad(src, t0, 0).r;
+  if (z0 > U.fluid.w*0.5) { return z0; }
+
+  let R   = i32(U.fluid.z);
+  let sg  = max(f32(R)*0.45, 1.0);
+  // 手前側は狭く、奥側は広く取る（手前の輪郭を鈍らせない）
+  let thr = max(U.fluid.x*4.2, 1e-4);
+  let lo  = z0 - thr*0.55;
+  let hi  = z0 + thr;
+
+  var sum  = z0;
+  var wsum = 1.0;
+  for (var k = 1; k <= R; k++) {
+    let w = exp(-f32(k*k)/(2.0*sg*sg));
+    for (var sgn = -1; sgn <= 1; sgn += 2) {
+      let t = t0 + dir*(k*sgn);
+      if (t.x < 0 || t.y < 0 || t.x >= res.x || t.y >= res.y) { continue; }
+      let zs = textureLoad(src, t, 0).r;
+      // 液体のない画素は「奥にある液体」ではないので、平均に入れてはいけない。
+      // 入れると、細い筋や縁がまとめて奥へ押しやられて消えてしまう
+      // （落ちる紐が見えない／壁ぎわに隙間ができる／面が震える、の原因）。
+      if (zs > U.fluid.w*0.5) { continue; }
+      sum  += clamp(zs, lo, hi)*w;
+      wsum += w;
+    }
+  }
+  return sum/wsum;
+}
+
+@fragment fn fsSmoothX(i: VO) -> @location(0) f32 { return smoothDir(i.pos.xy, vec2i(1, 0)); }
+@fragment fn fsSmoothY(i: VO) -> @location(0) f32 { return smoothDir(i.pos.xy, vec2i(0, 1)); }
+`;
+
+// --- 描画に使う位置を時間方向にならす ---
+//   ソルバの1ステップごとの細かい揺れがそのまま見えると、粒が振動して見える。
+//   描画用に少し遅れて追従する位置を別に持ち、そちらを描く。
+//   大きく飛んだとき（やり直し・反転の直後）は追従させる。
+const WGSL_RPOS = `
+struct RP { p: vec4f };          // x = 追従率, y = 粒子数, z = 追いつく距離
+@group(0) @binding(0) var<uniform> P: RP;
+@group(0) @binding(1) var<storage, read>       src: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4f>;
+
+@compute @workgroup_size(64)
+fn csRenderPos(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= u32(P.p.y)) { return; }
+  let a = src[i].xyz;
+  let b = dst[i].xyz;
+  let d = a - b;
+  let k = select(P.p.x, 1.0, dot(d, d) > P.p.z*P.p.z);
+  dst[i] = vec4f(b + d*k, 0.0);
+}
+`;
+
+/* ==========================================================================
+   SIM — 二相流体ソルバ（WebGPU の計算シェーダ）
+   ========================================================================== */
+
+const FAR = 1.0e5;
+
+const Sim = {
+  ready: false,
+  N: 0, nLiquid: 0, nGas: 0,
+  spacing: 0, h: 0, rho0: 1, cells: 0, dims: [0,0,0], origin: [0,0,0],
+
+  init(dev){
+    const C = CONFIG.sim;
+    const seed = seedParticles(C.particles);
+    this.N       = seed.count;
+    this.nLiquid = seed.nLiquid;
+    this.nGas    = seed.count - seed.nLiquid;
+    this.spacing = seed.spacing;
+    this.h       = C.hFactor*seed.spacing;
+    this.rho0    = latticeDensity(seed.spacing, this.h);   // 質量1のときの格子密度
+
+    // 近傍グリッド（空洞を包む箱を1セルぶん広げる）
+    const cb = SHAPE.cavityBound, cell = this.h;
+    this.origin = [-cb.r - cell, -cb.h - cell, -cb.r - cell];
+    this.dims = [
+      Math.ceil((2*cb.r + 2*cell)/cell) + 1,
+      Math.ceil((2*cb.h + 2*cell)/cell) + 1,
+      Math.ceil((2*cb.r + 2*cell)/cell) + 1,
+    ];
+    this.cells = this.dims[0]*this.dims[1]*this.dims[2];
+
+    const mk = (size) => dev.createBuffer({
+      size: Math.max(16, size),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    this.bufPos = mk(this.N*16);
+    this.bufVel = mk(this.N*16);
+    this.bufCur = mk(this.N*16);
+    this.bufNxt = mk(this.N*16);
+    this.bufLam = mk(this.N*4);
+    this.bufCnt = mk(this.cells*4);
+    this.bufItm = mk(this.cells*C.cellCap*4);
+    // 描画用（時間方向にならした位置）。空気を格子で持つときは、後ろに泡を描く球を置く
+    this.grid = GRID_AIR();
+    if (this.grid) { this.gridDims(); this.nGas = this.nCells; }
+    this.bufRender = mk((this.N + (this.grid ? this.nCells : 0))*16);
+    this.bufStat = dev.createBuffer({ size: 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    this.ub     = dev.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.stage = [0, 1].map(() => ({
+      buf: dev.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+      busy: false,
+    }));
+    this.stats = new Uint32Array(8);
+
+    dev.queue.writeBuffer(this.bufPos, 0, seed.positions);
+    dev.queue.writeBuffer(this.bufRender, 0, seed.positions);
+    dev.queue.writeBuffer(this.bufVel, 0, new Float32Array(this.N*4));
+
+    // --- パイプライン ---
+    const st = GPUShaderStage.COMPUTE;
+    const ent = [{ binding: 0, visibility: st, buffer: { type: 'uniform' } }];
+    for (let b = 1; b <= 8; b++) ent.push({ binding: b, visibility: st, buffer: { type: 'storage' } });
+    const bgl = dev.createBindGroupLayout({ entries: ent });
+    const layout = dev.createPipelineLayout({ bindGroupLayouts: [bgl] });
+    const mod = dev.createShaderModule({ code: buildSimWGSL(SHAPE, C.cellCap), label: 'sim' });
+
+    const bg = (a, b) => dev.createBindGroup({ layout: bgl, entries: [
+      { binding: 0, resource: { buffer: this.ub } },
+      { binding: 1, resource: { buffer: this.bufPos } },
+      { binding: 2, resource: { buffer: this.bufVel } },
+      { binding: 3, resource: { buffer: a } },
+      { binding: 4, resource: { buffer: b } },
+      { binding: 5, resource: { buffer: this.bufLam } },
+      { binding: 6, resource: { buffer: this.bufCnt } },
+      { binding: 7, resource: { buffer: this.bufItm } },
+      { binding: 8, resource: { buffer: this.bufStat } },
+    ]});
+    this.bg = [bg(this.bufCur, this.bufNxt), bg(this.bufNxt, this.bufCur)];
+
+    const pipe = (name) => dev.createComputePipeline({
+      layout, compute: { module: mod, entryPoint: name }, label: name,
+    });
+    this.p = {
+      predict : pipe('csPredict'),
+      clear   : pipe('csClear'),
+      build   : pipe('csBuild'),
+      lambda  : pipe('csLambda'),
+      delta   : pipe('csDelta'),
+      final   : pipe('csFinal'),
+      visc    : pipe('csVisc'),
+      applyV  : pipe('csApplyVel'),
+      statCl  : pipe('csStatsClear'),
+      stat    : pipe('csStats'),
+    };
+
+    // 描画用の位置をならすパイプライン（必要なのは2本だけなので別レイアウト）
+    const rbgl = dev.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: st, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: st, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: st, buffer: { type: 'storage' } },
+    ]});
+    this.rub = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.pRender = dev.createComputePipeline({
+      layout: dev.createPipelineLayout({ bindGroupLayouts: [rbgl] }),
+      compute: { module: dev.createShaderModule({ code: WGSL_RPOS, label: 'rpos' }), entryPoint: 'csRenderPos' },
+    });
+    this.bgRender = dev.createBindGroup({ layout: rbgl, entries: [
+      { binding: 0, resource: { buffer: this.rub } },
+      { binding: 1, resource: { buffer: this.bufPos } },
+      { binding: 2, resource: { buffer: this.bufRender } },
+    ]});
+    dev.queue.writeBuffer(this.rub, 0, new Float32Array([
+      CONFIG.sim.renderFollow, this.N, this.spacing*6, 0]));
+
+    this.spData = new Float32Array(44);
+    this.spU32  = new Uint32Array(this.spData.buffer);
+    if (this.grid) this.initGrid(dev, mk);
+    this.ready  = true;
+  },
+
+  // 空気の圧力格子（CONFIG.sim.air = 'grid' のとき）
+  // 格子の寸法。描画用の位置の配列に空気の球のぶんを足すので、バッファより先に決める
+  gridDims(){
+    const C = CONFIG.sim, cb = SHAPE.cavityBound, s = this.spacing;
+    const hc = C.gridCell*s, hf = Math.min(C.gridFine, C.gridCell)*s;
+    const O = SHAPE.orifice.p, rh = SHAPE.orifice.r;
+    // 軸ごとに「粗い・細かい・粗い」。細かい帯は穴を中心に、x と z は穴の半径の bandXZ 倍、
+    // y は仕切りの厚みに穴の半径の bandY 倍を足した範囲
+    const axis = (lo, hi, c, w) => {
+      const nf = Math.max(0, Math.ceil(2*w/hf));
+      const x0 = c - 0.5*nf*hf, x1 = c + 0.5*nf*hf;
+      const nL = Math.max(1, Math.ceil((x0 - lo)/hc));
+      const nR = Math.max(1, Math.ceil((hi - x1)/hc));
+      return { lo: x0 - nL*hc, nL, nf, n: nL + nf + nR };
+    };
+    const wxz = hf < hc ? rh*C.fineBandXZ : 0;
+    const wy  = hf < hc ? SHAPE.plateHalf + rh*C.fineBandY : 0;
+    this.gax = [
+      axis(-cb.r - hc, cb.r + hc, O[0], wxz),
+      axis(-cb.h - hc, cb.h + hc, O[1], wy),
+      axis(-cb.r - hc, cb.r + hc, O[2], wxz),
+    ];
+    this.gdx   = hc;
+    this.gfine = hf;
+    this.gdim  = this.gax.map(q => q.n);
+    // 座標 → 番号（JS 側。穴の行を決めるのに使う）
+    this.gIndex = (a, x) => {
+      const q = this.gax[a], x0 = q.lo + q.nL*hc, x1 = x0 + q.nf*hf;
+      if (x <= x0) return (x - q.lo)/hc;
+      if (x <= x1) return q.nL + (x - x0)/hf;
+      return q.nL + q.nf + (x - x1)/hc;
+    };
+    this.nF     = (this.gdim[0] + 1)*(this.gdim[1] + 1)*(this.gdim[2] + 1);
+    this.nCells = this.gdim[0]*this.gdim[1]*this.gdim[2];
+  },
+
+  initGrid(dev, mk){
+    const nf = this.nF;
+    const B = {
+      acc: mk(nf*32), U: mk(nf*16), A: mk(nf*16), L: mk(nf*16), B: mk(nf*16), P: mk(nf*16),
+      red: mk((16 + Math.ceil(nf/256))*4),
+    };
+    this.gb  = B;
+    this.gub = dev.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.gData = new Float32Array(40);
+    this.gU32  = new Uint32Array(this.gData.buffer);
+
+    const mod = dev.createShaderModule({ code: buildGridWGSL(SHAPE), label: 'grid' });
+    // 入口ごとに使うバッファが違う（1本の配置にまとめると上限の8本を超える）ので、
+    // 配置は自動にし、入口ごとに使う番号だけを束ねる。
+    const res = {
+      0: this.gub, 1: B.acc, 2: B.U, 3: B.A, 4: B.L, 5: B.B, 6: B.P, 7: B.red,
+      8: this.bufPos, 9: this.bufVel, 10: this.bufStat, 11: this.bufRender,
+    };
+    const mkp = (name, binds) => {
+      const pipeline = dev.createComputePipeline({
+        layout: 'auto', compute: { module: mod, entryPoint: name }, label: name });
+      const bg = dev.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+        entries: binds.map(b => ({ binding: b, resource: { buffer: res[b] } })) });
+      return { pipeline, bg };
+    };
+    this.gp = {
+      init    : mkp('gsInit',    [0, 3, 4, 6]),
+      clear   : mkp('gsClear',   [0, 1]),
+      p2g     : mkp('gsP2G',     [0, 1, 8, 9]),
+      combine : mkp('gsCombine', [0, 1, 2, 3, 4, 5]),
+      visc0   : mkp('gsVisc0',   [0, 2, 3, 5, 6]),
+      viscPA  : mkp('gsViscPA',  [0, 2, 3, 5, 6]),
+      viscAP  : mkp('gsViscAP',  [0, 2, 3, 5, 6]),
+      viscEnd : mkp('gsViscEnd', [0, 2, 6]),
+      chSum   : mkp('gsChSum',   [0, 2, 4, 7]),
+      chBeta  : mkp('gsChBeta',  [0, 5, 7]),
+      redCh   : mkp('gsRedCh',   [0, 7]),
+      redChB  : mkp('gsRedChB',  [0, 7]),
+      chFix   : mkp('gsChFix',   [0, 2, 4, 5, 6, 7]),
+      tgtSum  : mkp('gsTgtSum',  [0, 5, 7]),
+      redTgt  : mkp('gsRedTgt',  [0, 7]),
+      tgtCnt  : mkp('gsTgtCnt',  [0, 5, 7]),
+      redCnt  : mkp('gsRedCnt',  [0, 7]),
+      resid   : mkp('gsResid',   [0, 2, 4, 5, 6, 7]),
+      redInit : mkp('gsRedInit', [0, 7]),
+      apply   : mkp('gsApply',   [0, 4, 5, 6, 7]),
+      redA    : mkp('gsRedA',    [0, 7]),
+      update  : mkp('gsUpdate',  [0, 4, 5, 6, 7]),
+      redB    : mkp('gsRedB',    [0, 7]),
+      dir     : mkp('gsDir',     [0, 4, 5, 6, 7]),
+      project : mkp('gsProject', [0, 2, 5, 6]),
+      advect  : mkp('gsAdvect',  [0, 2, 3, 4]),
+      g2p     : mkp('gsG2P',     [0, 2, 4, 5, 8, 9]),
+      airDraw : mkp('gsAirDraw', [0, 2, 4, 11]),
+      stats   : mkp('gsStats',   [0, 2, 4, 10]),
+    };
+    this.gNeedInit = true;
+  },
+
+  writeGridParams(dev, dt, g){
+    const D = this.gData, Uu = this.gU32, s = this.spacing;
+    Uu[0]=this.gdim[0]; Uu[1]=this.gdim[1]; Uu[2]=this.gdim[2]; Uu[3]=this.N;
+    D[4]=0; D[5]=0; D[6]=0; D[7]=this.gdx;
+    D[8]=dt; D[9]=1/CONFIG.sim.densityRatio; D[10]=CONFIG.sim.flip; D[11]=CONFIG.sim.phiFull;
+    D[12]=g[0]; D[13]=g[1]; D[14]=g[2]; D[15]=Math.pow(this.gdx/s, 3);
+    const O = SHAPE.orifice.p;
+    D[16]=O[0]; D[17]=O[1]; D[18]=O[2]; D[19]=0;
+    D[20]=CONFIG.sim.gridVisc; D[21]=CONFIG.sim.volCorr; D[22]=CONFIG.sim.gridViscWall;
+    D[23]=Math.floor(this.gIndex(1, O[1]));   // 穴の中ほどの行。ここより上を上の部屋とする
+    D[24]=this.gfine; D[25]=0; D[26]=0; D[27]=0;
+    for (let a = 0; a < 3; a++) {
+      const q = this.gax[a];
+      D[28 + a*4]=q.lo; D[29 + a*4]=q.nL; D[30 + a*4]=q.nf; D[31 + a*4]=0;
+    }
+    dev.queue.writeBuffer(this.gub, 0, D);
+  },
+
+  // 格子の1ステップ。粒子の PBF の前に、同じパスの中で走らせる
+  gridStep(pass){
+    const run = (p, n) => {
+      pass.setPipeline(p.pipeline); pass.setBindGroup(0, p.bg); pass.dispatchWorkgroups(n);
+    };
+    const P = this.gp, w64 = Math.ceil(this.nF/64), w256 = Math.ceil(this.nF/256);
+    const wgP = Math.ceil(this.N/64);
+    if (this.gNeedInit) { run(P.init, w64); this.gNeedInit = false; }
+    run(P.clear,   w64);
+    run(P.p2g,     wgP);
+    run(P.combine, w64);
+    if (CONFIG.sim.gridVisc > 0) {
+      run(P.visc0, w64);
+      for (let it = 0; it < CONFIG.sim.gridViscIters; it++) { run(P.viscPA, w64); run(P.viscAP, w64); }
+      run(P.viscEnd, w64);
+    }
+    run(P.tgtSum,  w256);
+    run(P.redTgt,  1);
+    run(P.tgtCnt,  w256);
+    run(P.redCnt,  1);
+    run(P.resid,   w256);
+    run(P.redInit, 1);
+    for (let it = 0; it < CONFIG.sim.cgIters; it++) {
+      run(P.apply,  w256);
+      run(P.redA,   1);
+      run(P.update, w256);
+      run(P.redB,   1);
+      run(P.dir,    w256);
+    }
+    run(P.project, w64);
+    run(P.chSum,   w256);
+    run(P.redCh,   1);
+    run(P.chBeta,  w256);
+    run(P.redChB,  1);
+    run(P.chFix,   w64);
+    run(P.advect,  w64);
+    run(P.g2p,     wgP);
+  },
+
+  // 泡を描くための球を置く（1フレームに1回でよい）
+  gridDraw(enc){
+    if (!this.grid) return;
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.gp.airDraw.pipeline); pass.setBindGroup(0, this.gp.airDraw.bg);
+    pass.dispatchWorkgroups(Math.ceil(this.nCells/64));
+    pass.end();
+  },
+
+  writeParams(dev, dt, g){
+    const C = CONFIG.sim, D = this.spData, Uu = this.spU32;
+    const h = this.h, s = this.spacing;
+    const poly6C = 315/(64*Math.PI*Math.pow(h, 9));
+    const spikyC = -45/(Math.PI*Math.pow(h, 6));
+    const wq     = poly6(Math.pow(C.sCorrQ*h, 2), h);
+
+    // λ の分母のおおよその大きさ。CFM と人工圧力をこれに合わせて正規化すると、
+    // 粒子数や平滑化半径を変えても同じ見え方になる。
+    const gradN  = (45/(Math.PI*Math.pow(h, 6)))*Math.pow(0.5*h, 2)/this.rho0;
+    const denomR = Math.max(30*gradN*gradN, 1e-20);
+    // 凝集カーネルも同様に正規化する。1.0 で重力と同程度の加速度になる。
+    const cohR   = Math.PI*h*h*h/15;
+
+    D[0]=g[0]; D[1]=g[1]; D[2]=g[2];  D[3]=dt;
+    D[4]=this.origin[0]; D[5]=this.origin[1]; D[6]=this.origin[2]; D[7]=h;
+    Uu[8]=this.dims[0]; Uu[9]=this.dims[1]; Uu[10]=this.dims[2]; Uu[11]=this.N;
+    D[12]=h; D[13]=poly6C; D[14]=spikyC; D[15]=this.rho0;
+    D[16]=C.relax*denomR; D[17]=C.sCorrK/denomR; D[18]=C.sCorrN; D[19]=Math.max(wq, 1e-12);
+    D[20]=C.viscosity; D[21]=C.cohesionLiq*cohR; D[22]=C.adhesion; D[23]=C.wallFric;
+    D[24]=C.radius*s; D[25]=C.maxVel; D[26]=C.wallBand*s; D[27]=C.damping;
+    D[28]=this.nLiquid; D[29]=C.densityRatio; D[30]=C.phaseRepel*s; D[31]=C.cohesionGas*cohR;
+    D[32]=C.viscCross; D[33]=C.wallFricGas; D[34]=C.phaseRepel*s*0.9; D[35]=SHAPE.cavityBound.r;
+    D[36]=C.swirl; D[37]=Math.max(C.swirlWidth, 1e-3); D[38]=this.grid ? 0 : 1; D[39]=0;
+    const O = SHAPE.orifice.p;
+    D[40]=O[0]; D[41]=O[1]; D[42]=O[2]; D[43]=0;
+    dev.queue.writeBuffer(this.ub, 0, D);
+  },
+
+  // 1フレームぶんを進める
+  step(dev, enc, dt, gravityDir){
+    if (!this.ready) return;
+    const C = CONFIG.sim;
+    const sub = C.substeps;
+    const h   = dt/sub;
+    const j   = Gravity.jolt;
+    const g   = [gravityDir[0]*C.gravity + j[0],
+                 gravityDir[1]*C.gravity + j[1],
+                 gravityDir[2]*C.gravity + j[2]];
+    const wgP = Math.ceil(this.N/64);
+    const wgC = Math.ceil(this.cells/64);
+
+    this.writeParams(dev, h, g);
+    if (this.grid) this.writeGridParams(dev, h, g);
+
+    for (let k = 0; k < sub; k++) {
+      const pass = enc.beginComputePass();
+      if (this.grid) this.gridStep(pass);
+      let a = 0;
+      const run = (pipe, n) => {
+        pass.setPipeline(pipe);
+        pass.setBindGroup(0, this.bg[a]);
+        pass.dispatchWorkgroups(n);
+      };
+
+      run(this.p.predict, wgP);
+      run(this.p.clear,   wgC);
+      run(this.p.build,   wgP);
+      for (let it = 0; it < C.iters; it++) {
+        run(this.p.lambda, wgP);
+        run(this.p.delta,  wgP);   // cur -> nxt
+        a ^= 1;
+      }
+      run(this.p.final, wgP);
+      for (let it = 0; it < C.viscIters; it++) {
+        run(this.p.visc,   wgP);   // pos,vel -> nxt
+        run(this.p.applyV, wgP);
+      }
+      if (DEBUG && k === sub - 1) {
+        run(this.p.statCl, 1);
+        run(this.p.stat,   wgP);
+        if (this.grid) {
+          pass.setPipeline(this.gp.stats.pipeline); pass.setBindGroup(0, this.gp.stats.bg);
+          pass.dispatchWorkgroups(Math.ceil(this.nF/64));
+        }
+      }
+      pass.end();
+    }
+
+    // 描画用の位置をならす
+    const rp = enc.beginComputePass();
+    rp.setPipeline(this.pRender);
+    rp.setBindGroup(0, this.bgRender);
+    rp.dispatchWorkgroups(wgP);
+    rp.end();
+  },
+
+  // 交換量の読み戻し（調整用。?debug=1 のときだけ）
+  copyStats(enc){
+    if (!this.ready || !DEBUG) return;
+    const st = this.stage.find(x => !x.busy);
+    if (!st) return;
+    st.busy = true;
+    this.pending = st;
+    enc.copyBufferToBuffer(this.bufStat, 0, st.buf, 0, 32);
+  },
+  mapStats(){
+    const st = this.pending;
+    if (!st) return;
+    this.pending = null;
+    st.buf.mapAsync(GPUMapMode.READ).then(() => {
+      this.stats.set(new Uint32Array(st.buf.getMappedRange()));
+      st.buf.unmap();
+      st.busy = false;
+    }).catch(() => { st.busy = false; });
+  },
+
+  // 粒子を初期状態に戻す
+  reseed(dev){
+    if (!this.ready) return;
+    const seed = seedParticles(CONFIG.sim.particles);
+    const n = Math.min(seed.count, this.N);
+    dev.queue.writeBuffer(this.bufPos, 0, seed.positions, 0, n*4);
+    dev.queue.writeBuffer(this.bufRender, 0, seed.positions, 0, n*4);
+    dev.queue.writeBuffer(this.bufVel, 0, new Float32Array(this.N*4));
+    if (this.grid) this.gNeedInit = true;  // 空気の速度と圧力も消す
+  },
+};
+
+/* ==========================================================================
+   GPU — WebGPU バックエンド
+   ========================================================================== */
+
+const ENV_PRESETS = { studio: 0, room: 1, sunset: 2 };
+
+const Gpu = {
+  ok: false,
+  dev: null, ctx: null, fmt: null, adapterInfo: {},
+  ub: null, ubData: new Float32Array(96),
+  w: 0, h: 0,
+
+  async init(canvas){
+    if (!navigator.gpu) throw new Error(
+      'このブラウザは WebGPU に対応していないため、まだ動かせません。\n' +
+      'iPhone なら iOS 18 以降の Safari、Android なら新しい Chrome でお試しください。');
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) throw new Error('GPU アダプタを取得できませんでした。');
+    const dev = await adapter.requestDevice();
+    this.dev = dev;
+    this.adapterInfo = adapter.info || {};
+    dev.lost.then((info) => showError('GPU との接続が切れました。', info.message || ''));
+
+    const ctx = canvas.getContext('webgpu');
+    if (!ctx) throw new Error('WebGPU のキャンバスを作れませんでした。');
+    this.ctx = ctx;
+    this.fmt = navigator.gpu.getPreferredCanvasFormat();
+    ctx.configure({ device: dev, format: this.fmt, alphaMode: 'opaque' });
+
+    this.smp = dev.createSampler({
+      magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
+      addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
+    });
+    this.ub    = dev.createBuffer({ size: 384, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.envUB = dev.createBuffer({ size: 16,  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    // --- 環境キューブマップ ---
+    const S = CONFIG.env.faceSize, MIPS = CONFIG.env.mipCount;
+    this.envTex = dev.createTexture({
+      size: [S, S, 6], format: 'rgba16float', mipLevelCount: MIPS,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.envView = this.envTex.createView({ dimension: 'cube' });
+
+    // --- シェーダ ---
+    const mods = {
+      env   : dev.createShaderModule({ code: WGSL_ENVGEN,  label: 'envgen'  }),
+      blur  : dev.createShaderModule({ code: WGSL_ENVBLUR, label: 'envblur' }),
+      part  : dev.createShaderModule({ code: WGSL_PART,    label: 'part'    }),
+      smooth: dev.createShaderModule({ code: WGSL_SMOOTH,  label: 'smooth'  }),
+      main  : dev.createShaderModule({ code: buildMainWGSL(SHAPE), label: 'main' }),
+      post  : dev.createShaderModule({ code: WGSL_POST,    label: 'post'    }),
+    };
+    for (const [name, mod] of Object.entries(mods)) {
+      const info = await mod.getCompilationInfo();
+      const bad = info.messages.filter(m => m.type === 'error');
+      if (bad.length) {
+        throw new Error('シェーダ(' + name + ')のコンパイルに失敗:\n' +
+          bad.map(m => `  行${m.lineNum}: ${m.message}`).join('\n'));
+      }
+    }
+
+    const tgt = (format, blend) => ({ targets: [blend ? { format, blend } : { format }] });
+    const add = { color: { srcFactor:'one', dstFactor:'one' }, alpha: { srcFactor:'one', dstFactor:'one' } };
+
+    this.pipeEnv = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.env, entryPoint:'vsFull' },
+      fragment:{ module: mods.env, entryPoint:'fsEnv', ...tgt('rgba16float') } });
+    this.pipeBlur = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.blur, entryPoint:'vsFull' },
+      fragment:{ module: mods.blur, entryPoint:'fsBlur', ...tgt('rgba16float') } });
+
+    this.pipePartDepth = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.part, entryPoint:'vsPart' },
+      fragment:{ module: mods.part, entryPoint:'fsPartDepth', ...tgt('r32float') },
+      depthStencil:{ format:'depth32float', depthWriteEnabled:true, depthCompare:'less' } });
+    this.pipePartThick = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.part, entryPoint:'vsPart' },
+      fragment:{ module: mods.part, entryPoint:'fsPartThick', ...tgt('r16float', add) } });
+
+    this.pipeSmoothX = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.smooth, entryPoint:'vsFull' },
+      fragment:{ module: mods.smooth, entryPoint:'fsSmoothX', ...tgt('r32float') } });
+    this.pipeSmoothY = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.smooth, entryPoint:'vsFull' },
+      fragment:{ module: mods.smooth, entryPoint:'fsSmoothY', ...tgt('r32float') } });
+
+    this.pipeMain = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.main, entryPoint:'vsFull' },
+      fragment:{ module: mods.main, entryPoint:'fsMain', ...tgt('rgba16float') } });
+    this.pipePost = dev.createRenderPipeline({ layout:'auto',
+      vertex:{ module: mods.post, entryPoint:'vsFull' },
+      fragment:{ module: mods.post, entryPoint:'fsPost', ...tgt(this.fmt) } });
+
+    this.bgEnv = dev.createBindGroup({ layout: this.pipeEnv.getBindGroupLayout(0),
+      entries: [{ binding:0, resource:{ buffer: this.envUB } }] });
+
+    Sim.init(dev);
+    this.bgPart = dev.createBindGroup({ layout: this.pipePartDepth.getBindGroupLayout(0),
+      entries: [
+        { binding:0, resource:{ buffer: this.ub } },
+        { binding:1, resource:{ buffer: Sim.bufRender } },
+      ]});
+    this.bgPartThick = dev.createBindGroup({ layout: this.pipePartThick.getBindGroupLayout(0),
+      entries: [
+        { binding:0, resource:{ buffer: this.ub } },
+        { binding:1, resource:{ buffer: Sim.bufRender } },
+      ]});
+
+    this.ok = true;
+    this.buildEnv(CONFIG.env.preset);
+  },
+
+  buildEnv(presetName){
+    const dev = this.dev;
+    const preset = ENV_PRESETS[presetName] ?? 0;
+    const MIPS = CONFIG.env.mipCount;
+    const u32 = new Uint32Array(2), f32 = new Float32Array(2);
+
+    const renderFace = (pipeline, bindGroup, mip, face) => {
+      const view = this.envTex.createView({
+        dimension:'2d', baseMipLevel:mip, mipLevelCount:1,
+        baseArrayLayer:face, arrayLayerCount:1,
+      });
+      const enc = dev.createCommandEncoder();
+      const pass = enc.beginRenderPass({ colorAttachments:[{
+        view, loadOp:'clear', storeOp:'store', clearValue:{ r:0,g:0,b:0,a:1 } }]});
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(3);
+      pass.end();
+      dev.queue.submit([enc.finish()]);
+    };
+
+    for (let face = 0; face < 6; face++) {
+      u32[0] = face; u32[1] = preset; f32[0] = 0; f32[1] = 0;
+      dev.queue.writeBuffer(this.envUB, 0, u32);
+      dev.queue.writeBuffer(this.envUB, 8, f32);
+      renderFace(this.pipeEnv, this.bgEnv, 0, face);
+    }
+    for (let mip = 1; mip < MIPS; mip++) {
+      const srcView = this.envTex.createView({
+        dimension:'cube', baseMipLevel:mip-1, mipLevelCount:1,
+        baseArrayLayer:0, arrayLayerCount:6,
+      });
+      const bg = dev.createBindGroup({ layout: this.pipeBlur.getBindGroupLayout(0), entries:[
+        { binding:0, resource:{ buffer: this.envUB } },
+        { binding:1, resource: srcView },
+        { binding:2, resource: this.smp },
+      ]});
+      const lobe = 0.10*Math.pow(2, mip - 1);
+      for (let face = 0; face < 6; face++) {
+        u32[0] = face; u32[1] = preset; f32[0] = lobe; f32[1] = 0;
+        dev.queue.writeBuffer(this.envUB, 0, u32);
+        dev.queue.writeBuffer(this.envUB, 8, f32);
+        renderFace(this.pipeBlur, bg, mip, face);
+      }
+    }
+  },
+
+  resize(w, h){
+    if (w === this.w && h === this.h) return;
+    this.w = w; this.h = h;
+    const dev = this.dev;
+    for (const t of ['hdrTex','liqA','liqB','gasA','gasB','thickLiq','thickGas','depthTex'])
+      if (this[t]) this[t].destroy();
+
+    const mkTex = (format, usage) => dev.createTexture({ size:[w, h], format, usage });
+    const RT = GPUTextureUsage.RENDER_ATTACHMENT, TB = GPUTextureUsage.TEXTURE_BINDING;
+
+    // 流体の面は画面より低い解像度で作る。平滑化の手数を増やさずに
+    // 広い範囲を均せるので、粒の凹凸が消えてつながった液体に見える。
+    const fs = CONFIG.view.fluidScale;
+    const fw = Math.max(8, Math.round(w*fs));
+    const fh = Math.max(8, Math.round(h*fs));
+    this.fw = fw; this.fh = fh;
+    const fTex = (fmt) => dev.createTexture({ size:[fw, fh], format: fmt, usage: RT | TB });
+
+    this.hdrTex   = mkTex('rgba16float',  RT | TB);
+    this.liqA     = fTex('r32float');   // 液体の前面の深度
+    this.liqB     = fTex('r32float');   // 平滑化の作業用
+    this.gasA     = fTex('r32float');   // 空気の前面の深度
+    this.gasB     = fTex('r32float');
+    this.thickLiq = fTex('r16float');
+    this.thickGas = fTex('r16float');
+    this.depthTex = dev.createTexture({ size:[fw, fh], format:'depth32float', usage: RT });
+
+    this.hdrView   = this.hdrTex.createView();
+    this.liqAView  = this.liqA.createView();
+    this.liqBView  = this.liqB.createView();
+    this.gasAView  = this.gasA.createView();
+    this.gasBView  = this.gasB.createView();
+    this.thickLView= this.thickLiq.createView();
+    this.thickGView= this.thickGas.createView();
+    this.depthView = this.depthTex.createView();
+
+    this.bgMain = dev.createBindGroup({ layout: this.pipeMain.getBindGroupLayout(0), entries:[
+      { binding:0, resource:{ buffer: this.ub } },
+      { binding:1, resource: this.envView },
+      { binding:2, resource: this.smp },
+      { binding:3, resource: this.liqAView },
+      { binding:4, resource: this.thickLView },
+      { binding:5, resource: this.gasAView },
+      { binding:6, resource: this.thickGView },
+    ]});
+    this.bgPost = dev.createBindGroup({ layout: this.pipePost.getBindGroupLayout(0), entries:[
+      { binding:0, resource:{ buffer: this.ub } },
+      { binding:1, resource: this.hdrView },
+      { binding:2, resource: this.smp },
+    ]});
+    const smBG = (pipe, view) => dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries:[
+      { binding:0, resource:{ buffer: this.ub } },
+      { binding:1, resource: view },
+    ]});
+    this.bgSmLX = smBG(this.pipeSmoothX, this.liqAView);
+    this.bgSmLY = smBG(this.pipeSmoothY, this.liqBView);
+    this.bgSmGX = smBG(this.pipeSmoothX, this.gasAView);
+    this.bgSmGY = smBG(this.pipeSmoothY, this.gasBView);
+  },
+
+  render(dt, gravityDir){
+    const dev = this.dev;
+    const enc = dev.createCommandEncoder();
+
+    // 1) 流体を進める
+    Sim.step(dev, enc, dt, gravityDir);
+    Sim.gridDraw(enc);
+
+    const col = (view, clear) => ({ view, loadOp:'clear', storeOp:'store', clearValue: clear });
+    const FARC = { r:FAR, g:0, b:0, a:0 };
+    const ZERO = { r:0, g:0, b:0, a:0 };
+
+    // 粒子を球として描いて、相ごとに前面の深度を取る
+    const depthPass = (view, first, count) => {
+      const pass = enc.beginRenderPass({
+        colorAttachments:[col(view, FARC)],
+        depthStencilAttachment:{
+          view: this.depthView, depthLoadOp:'clear', depthStoreOp:'store', depthClearValue:1.0,
+        },
+      });
+      if (count > 0) {
+        pass.setPipeline(this.pipePartDepth);
+        pass.setBindGroup(0, this.bgPart);
+        pass.draw(6, count, 0, first);
+      }
+      pass.end();
+    };
+    // 深度の平滑化（横 -> 縦）
+    const smoothPass = (dst, pipe, bg, clear) => {
+      const pass = enc.beginRenderPass({ colorAttachments:[col(dst, clear)] });
+      pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.draw(3); pass.end();
+    };
+    // 厚み（吸収と、スラブの奥行きに使う）
+    const thickPass = (view, first, count) => {
+      const pass = enc.beginRenderPass({ colorAttachments:[col(view, ZERO)] });
+      if (count > 0) {
+        pass.setPipeline(this.pipePartThick);
+        pass.setBindGroup(0, this.bgPartThick);
+        pass.draw(6, count, 0, first);
+      }
+      pass.end();
+    };
+
+    depthPass(this.liqAView, 0, Sim.nLiquid);
+    smoothPass(this.liqBView, this.pipeSmoothX, this.bgSmLX, FARC);
+    smoothPass(this.liqAView, this.pipeSmoothY, this.bgSmLY, FARC);
+
+    depthPass(this.gasAView, Sim.nLiquid, Sim.nGas);
+    smoothPass(this.gasBView, this.pipeSmoothX, this.bgSmGX, FARC);
+    smoothPass(this.gasAView, this.pipeSmoothY, this.bgSmGY, FARC);
+
+    thickPass(this.thickLView, 0, Sim.nLiquid);
+    thickPass(this.thickGView, Sim.nLiquid, Sim.nGas);
+
+    // 本体
+    {
+      const pass = enc.beginRenderPass({ colorAttachments:[col(this.hdrView, { r:0,g:0,b:0,a:1 })] });
+      pass.setPipeline(this.pipeMain); pass.setBindGroup(0, this.bgMain); pass.draw(3); pass.end();
+    }
+    // トーンマップ
+    {
+      const pass = enc.beginRenderPass({
+        colorAttachments:[col(this.ctx.getCurrentTexture().createView(), { r:0,g:0,b:0,a:1 })] });
+      pass.setPipeline(this.pipePost); pass.setBindGroup(0, this.bgPost); pass.draw(3); pass.end();
+    }
+    Sim.copyStats(enc);
+    dev.queue.submit([enc.finish()]);
+    Sim.mapStats();
+  },
+};
+
+/* ==========================================================================
+   APP — 初期化・リサイズ・メインループ
+   ========================================================================== */
+
+const canvas = document.getElementById('view');
+const hud    = document.getElementById('hud');
+
+function showError(msg, detail){
+  document.getElementById('errmsg').textContent = msg;
+  document.getElementById('errdetail').textContent = detail || '';
+  document.getElementById('errdetail').style.display = detail ? '' : 'none';
+  document.getElementById('err').classList.add('show');
+  console.error(msg, detail || '');
+}
+
+// --- カメラ（固定。わずかに見下ろす） ---
+const CAM = (() => {
+  const el = 0.0, az = 0.0;
+  const d  = CONFIG.view.camDist;
+  const pos = [d*Math.cos(el)*Math.sin(az), d*Math.sin(el), d*Math.cos(el)*Math.cos(az)];
+  const L = Math.hypot(...pos);
+  const fwd = pos.map(v => -v/L);
+  let rx = fwd[1]*0 - fwd[2]*1, ry = fwd[2]*0 - fwd[0]*0, rz = fwd[0]*1 - fwd[1]*0;
+  const rl = Math.hypot(rx, ry, rz); rx/=rl; ry/=rl; rz/=rl;
+  const up = [
+    ry*fwd[2] - rz*fwd[1],
+    rz*fwd[0] - rx*fwd[2],
+    rx*fwd[1] - ry*fwd[0],
+  ];
+  return { pos, fwd, right:[rx, ry, rz], up, tanHalf: CONFIG.view.fitHalfHeight/d };
+})();
+
+let renderW = 0, renderH = 0, aspect = 1;
+
+// 描画の重さに合わせて解像度を上下させる。
+// 計算（ソルバ）が時間の大半を使うので、狙いは「20fps前後を保ちつつ
+// 余った分を解像度に回す」こと。高いfpsを狙うと解像度が落ちすぎる。
+const Quality = {
+  scale: 0.85, min: 0.55, max: 1.0,
+  target: 46, acc: 0, n: 0, hold: 1.2,
+  update(dt, ms){
+    this.acc += ms; this.n++;
+    this.hold -= dt;
+    if (this.n < 30 || this.hold > 0) return;
+    const avg = this.acc/this.n;
+    this.acc = 0; this.n = 0;
+    if (avg > this.target + 6 && this.scale > this.min) {
+      this.scale = Math.max(this.min, this.scale - 0.10);
+      this.hold = 1.5; resize();
+    } else if (avg < this.target - 10 && this.scale < this.max) {
+      this.scale = Math.min(this.max, this.scale + 0.05);
+      this.hold = 3.0; resize();
+    }
+  },
+};
+
+function resize(){
+  const cssW = Math.max(1, Math.round(canvas.clientWidth  || innerWidth));
+  const cssH = Math.max(1, Math.round(canvas.clientHeight || innerHeight));
+  const dpr  = Math.min(devicePixelRatio || 1, CONFIG.view.maxDpr)*Quality.scale;
+  const MAXPIX = 2.6e6;
+  let w = Math.round(cssW*dpr), h = Math.round(cssH*dpr);
+  if (w*h > MAXPIX) {
+    const k = Math.sqrt(MAXPIX/(w*h));
+    w = Math.max(1, Math.round(w*k));
+    h = Math.max(1, Math.round(h*k));
+  }
+  if (w === renderW && h === renderH) return;
+  renderW = w; renderH = h; aspect = w/h;
+  canvas.width = w; canvas.height = h;
+  if (Gpu.ok) Gpu.resize(w, h);
+}
+
+function writeUniforms(time){
+  const U = Gpu.ubData;
+  const R = CAM.right, Up = CAM.up, F = CAM.fwd, P = CAM.pos;
+  const gUp = Gravity.up;
+  const L = CONFIG.liquid, G = CONFIG.glass;
+
+  // view（世界 -> ビュー、列優先）
+  U[0]=R[0];  U[1]=Up[0]; U[2]=-F[0]; U[3]=0;
+  U[4]=R[1];  U[5]=Up[1]; U[6]=-F[1]; U[7]=0;
+  U[8]=R[2];  U[9]=Up[2]; U[10]=-F[2]; U[11]=0;
+  U[12]=-(R[0]*P[0]+R[1]*P[1]+R[2]*P[2]);
+  U[13]=-(Up[0]*P[0]+Up[1]*P[1]+Up[2]*P[2]);
+  U[14]=  F[0]*P[0]+F[1]*P[1]+F[2]*P[2];
+  U[15]=1;
+
+  // proj（透視投影。z は 0..1）
+  const near = 0.25, far = 24.0;
+  const fy = 1/CAM.tanHalf;
+  U[16]=fy/aspect; U[17]=0;  U[18]=0;                  U[19]=0;
+  U[20]=0;         U[21]=fy; U[22]=0;                  U[23]=0;
+  U[24]=0;         U[25]=0;  U[26]=far/(near-far);     U[27]=-1;
+  U[28]=0;         U[29]=0;  U[30]=far*near/(near-far); U[31]=0;
+
+  // viewProj = proj * view（列優先）
+  for (let c = 0; c < 4; c++)
+    for (let r = 0; r < 4; r++) {
+      let v = 0;
+      for (let k = 0; k < 4; k++) v += U[16 + k*4 + r]*U[c*4 + k];
+      U[32 + c*4 + r] = v;
+    }
+
+  U[48]=R[0];  U[49]=R[1];  U[50]=R[2];  U[51]=CAM.tanHalf;
+  U[52]=Up[0]; U[53]=Up[1]; U[54]=Up[2]; U[55]=aspect;
+  const VIEWS = { phase: 1, gas: 2, liq: 3 };
+  U[56]=F[0];  U[57]=F[1];  U[58]=F[2];  U[59]=VIEWS[QS.get('view')] || 0;
+  U[60]=P[0];  U[61]=P[1];  U[62]=P[2];  U[63]=time;
+  U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=0;
+  U[68]=L.color[0]; U[69]=L.color[1]; U[70]=L.color[2]; U[71]=L.absorb;
+  U[72]=G.color[0]; U[73]=G.color[1]; U[74]=G.color[2]; U[75]=G.absorb;
+  U[76]=G.ior; U[77]=L.ior; U[78]=G.roughness; U[79]=CONFIG.view.exposure;
+  U[80]=renderW; U[81]=renderH; U[82]=1/renderW; U[83]=1/renderH;
+  U[84]=SHAPE.bound.r; U[85]=SHAPE.bound.h;
+  U[86]=CONFIG.env.mipCount - 1; U[87]=CONFIG.env.bgGain;
+
+  // 流体の描画パラメータ（平滑化の半径は「流体バッファの画素」で数える）
+  const fw = Gpu.fw || Math.max(8, Math.round(renderW*CONFIG.view.fluidScale));
+  const fh = Gpu.fh || Math.max(8, Math.round(renderH*CONFIG.view.fluidScale));
+  const s  = Sim.spacing || 0.02;
+  const pr = CONFIG.sim.drawRadius*s;
+  const screenR = pr/(CONFIG.view.camDist*CAM.tanHalf)*(fh*0.5);
+  U[88]=pr;
+  U[89]=3*s*s*s/(4*Math.PI*pr*pr*pr);
+  U[90]=Math.max(4, Math.min(30, Math.round(screenR*3.0)));
+  U[91]=FAR;
+  U[92]=fw; U[93]=fh; U[94]=1/fw; U[95]=1/fh;
+
+  Gpu.dev.queue.writeBuffer(Gpu.ub, 0, U);
+}
+
+const Perf = { t:0, n:0, fps:0, ms:0 };
+let lastT = 0;
+
+function frame(now){
+  const dt = Math.min(0.05, (now - lastT)/1000) || 0.016;
+  lastT = now;
+
+  if (document.hidden) { requestAnimationFrame(frame); return; }
+  Quality.update(dt, dt*1000);
+  resize();
+  Gravity.update(dt);
+  writeUniforms(now/1000);
+  const dtSim = Math.min(dt, 1/45);
+  TSIM.t += dtSim;
+  Gpu.render(dtSim, Gravity.down);
+
+  Perf.t += dt; Perf.n++;
+  if (Perf.t >= 0.5) {
+    Perf.fps = Perf.n/Perf.t; Perf.ms = 1000*Perf.t/Perf.n;
+    Perf.t = 0; Perf.n = 0;
+    if (DEBUG) {
+      const g = Gravity.down;
+      hud.textContent =
+        `fps ${Perf.fps.toFixed(1)}  (${Perf.ms.toFixed(2)} ms)\n` +
+        `描画 ${renderW}x${renderH}  品質 ${Quality.scale.toFixed(2)}\n` +
+        `粒子 ${Sim.N}  間隔 ${Sim.spacing.toFixed(4)}  h ${Sim.h.toFixed(4)}\n` +
+        `格子 ${Sim.dims.join('x')} = ${Sim.cells}  ρ0 ${Sim.rho0.toFixed(1)}\n` +
+        `液体 ${Sim.nLiquid}  空気 ${Sim.nGas}\n` +
+        `上に来た空気 ${Sim.stats[0]}  下に落ちた液体 ${Sim.stats[1]}\n` +
+        `空気の詰まり 最大 ${(Sim.stats[2]/1000).toFixed(2)}  平均 ${(Sim.stats[3]*100/1000/Math.max(Sim.nGas,1)).toFixed(2)}\n` +
+        `紐 ${threadPct().toFixed(1)}%  (${Sim.stats[4]}/${Sim.stats[5]})  落下率 ${(100*Sim.stats[1]/Math.max(Sim.nLiquid,1)).toFixed(1)}%  計算内 ${TSIM.t.toFixed(0)}s / 実時間 ${((now-T0)/1000).toFixed(0)}s\n` +
+        `形状 ${CONFIG.shape}  環境 ${CONFIG.env.preset}\n` +
+        `重力 ${g[0].toFixed(2)} ${g[1].toFixed(2)} ${g[2].toFixed(2)}\n` +
+        `GPU ${Gpu.adapterInfo.vendor || '?'} / ${Gpu.adapterInfo.architecture || '?'}`;
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ==========================================================================
+   UI — 隠しパネル（色と少しの調整）
+   ========================================================================== */
+
+const LIQUID_PRESETS = [
+  { name:'ブルー',   c:[0.13, 0.50, 0.96] },
+  { name:'シアン',   c:[0.08, 0.72, 0.80] },
+  { name:'グリーン', c:[0.22, 0.76, 0.32] },
+  { name:'ライム',   c:[0.62, 0.84, 0.14] },
+  { name:'イエロー', c:[0.96, 0.78, 0.10] },
+  { name:'アンバー', c:[0.97, 0.47, 0.08] },
+  { name:'レッド',   c:[0.93, 0.15, 0.18] },
+  { name:'パープル', c:[0.56, 0.22, 0.94] },
+];
+
+function hsv2rgb(h, s, v){
+  h = ((h % 360) + 360) % 360;
+  const c = v*s, x = c*(1 - Math.abs((h/60)%2 - 1)), m = v - c;
+  let r = 0, g = 0, b = 0;
+  if (h <  60)      { r=c; g=x; }
+  else if (h < 120) { r=x; g=c; }
+  else if (h < 180) { g=c; b=x; }
+  else if (h < 240) { g=x; b=c; }
+  else if (h < 300) { r=x; b=c; }
+  else              { r=c; b=x; }
+  return [r+m, g+m, b+m];
+}
+function rgb2hue(c){
+  const mx = Math.max(...c), mn = Math.min(...c);
+  if (mx - mn < 1e-6) return 210;
+  let h;
+  if (mx === c[0])      h = 60*(((c[1]-c[2])/(mx-mn))%6);
+  else if (mx === c[1]) h = 60*((c[2]-c[0])/(mx-mn) + 2);
+  else                  h = 60*((c[0]-c[1])/(mx-mn) + 4);
+  return (h + 360)%360;
+}
+const css = (c) => '#' + c.map(v =>
+  Math.round(Math.min(1, Math.max(0, Math.pow(v, 1/2.2)))*255).toString(16).padStart(2,'0')).join('');
+
+const UI = (() => {
+  const $ = (id) => document.getElementById(id);
+  let panel, gear, dimTimer = null, isOpen = false;
+  let st = {};
+
+  const load = () => { try { return JSON.parse(localStorage.getItem('oozetube') || '{}'); } catch(_) { return {}; } };
+  const save = () => { try { localStorage.setItem('oozetube', JSON.stringify(st)); } catch(_) {} };
+
+  function applyColor(c){
+    CONFIG.liquid.color = c.slice();
+    for (const b of $('swatches').children) {
+      b.setAttribute('aria-pressed', String(b.dataset.c === c.join(',')));
+    }
+    const h = Math.round(rgb2hue(c));
+    $('sHue').value = h;
+    $('vHue').textContent = h + '°';
+    $('sHue').style.background =
+      'linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)';
+  }
+
+  // 粘りは 0〜1 のひとつのつまみで、粘性（粒子どうしの速度の均し）・その回数・
+  // 全体の減衰をまとめて動かす。回数まで動かすのは、1回ぶんの均しでは
+  // 粘りの上限が決まってしまうため。細い通路でだけよく効く。
+  function setViscosity(v){
+    const k = Math.max(0, Math.min(1, v));
+    CONFIG.sim.viscosity = 0.55 + 0.43*k;
+    CONFIG.sim.damping   = 0.08 + 1.4*k;
+    CONFIG.sim.viscIters = Math.min(5, Math.max(1, Math.round(1 + 2.2*k)));
+    CONFIG.sim.gridVisc  = 0.5 + 3.0*k;     // 空気を格子で持つときの粘性（既定で約3）
+    $('sVis').value = k;
+    $('vVis').textContent = k.toFixed(2);
+  }
+  // 既定の粘り（CONFIG の初期値から逆算）
+  const viscFromConfig = (c) =>
+    Math.max(0, Math.min(1, (c.sim.viscosity - 0.55)/0.43));
+
+  function dimSoon(){
+    gear.classList.remove('dim');
+    clearTimeout(dimTimer);
+    dimTimer = setTimeout(() => { if (!isOpen) gear.classList.add('dim'); }, 3500);
+  }
+
+  function toggle(on){
+    isOpen = (on === undefined) ? !isOpen : on;
+    panel.classList.toggle('open', isOpen);
+    dimSoon();
+  }
+
+  function init(){
+    panel = $('panel'); gear = $('gear');
+    st = load();
+
+    // --- 色のプリセット ---
+    const sw = $('swatches');
+    for (const p of LIQUID_PRESETS) {
+      const b = document.createElement('button');
+      b.style.background = css(p.c);
+      b.title = p.name;
+      b.dataset.c = p.c.join(',');
+      b.onclick = () => { applyColor(p.c); st.color = p.c; save(); };
+      sw.appendChild(b);
+    }
+
+    // --- 初期値 ---
+    applyColor(st.color || CONFIG.liquid.color);
+    CONFIG.liquid.absorb   = st.absorb   ?? CONFIG.liquid.absorb;
+    CONFIG.sim.cohesionLiq = st.coh      ?? CONFIG.sim.cohesionLiq;
+    setViscosity(st.visc ?? viscFromConfig(CONFIG_DEFAULTS));
+    $('sAbs').value = CONFIG.liquid.absorb;
+    $('vAbs').textContent = CONFIG.liquid.absorb.toFixed(1);
+    $('sBub').value = CONFIG.sim.cohesionLiq;
+    $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
+    if (st.env && ENV_PRESETS[st.env] !== undefined) CONFIG.env.preset = st.env;
+    for (const b of $('segEnv').children) {
+      b.setAttribute('aria-pressed', String(b.dataset.env === CONFIG.env.preset));
+      b.onclick = () => {
+        CONFIG.env.preset = b.dataset.env;
+        st.env = b.dataset.env; save();
+        Gpu.buildEnv(CONFIG.env.preset);
+        for (const o of $('segEnv').children) o.setAttribute('aria-pressed', String(o === b));
+      };
+    }
+
+    // --- スライダー ---
+    $('sHue').oninput = (e) => {
+      const c = hsv2rgb(+e.target.value, 0.88, 0.96);
+      applyColor(c); st.color = c; save();
+    };
+    $('sAbs').oninput = (e) => {
+      CONFIG.liquid.absorb = +e.target.value;
+      $('vAbs').textContent = CONFIG.liquid.absorb.toFixed(1);
+      st.absorb = CONFIG.liquid.absorb; save();
+    };
+    $('sVis').oninput = (e) => { setViscosity(+e.target.value); st.visc = +e.target.value; save(); };
+    $('sBub').oninput = (e) => {
+      CONFIG.sim.cohesionLiq = +e.target.value;
+      $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
+      st.coh = CONFIG.sim.cohesionLiq; save();
+    };
+
+    // --- ボタン ---
+    gear.onclick    = () => toggle();
+    $('bFlip').onclick  = () => Gravity.flip();
+    $('bReset').onclick = () => Sim.reseed(Gpu.dev);
+    // 端末によって傾きの向きが逆になることがあるので、手動で直せるようにする
+    Gravity.inverted = !!st.inv;
+    const updInvert = () => {
+      $('bInvert').textContent = Gravity.inverted ? '上下を元に戻す' : '上下が逆のときはここ';
+    };
+    updInvert();
+    $('bInvert').onclick = () => {
+      Gravity.inverted = !Gravity.inverted;
+      st.inv = Gravity.inverted; save();
+      updInvert();
+    };
+
+    // 保存した設定をすべて捨てて、作り手が基準としている値に戻す
+    $('bDefault').onclick = () => {
+      const D = CONFIG_DEFAULTS;
+      CONFIG.liquid.color  = D.liquid.color.slice();
+      CONFIG.liquid.absorb = D.liquid.absorb;
+      CONFIG.sim.cohesionLiq = D.sim.cohesionLiq;
+      CONFIG.env.preset    = D.env.preset;
+      setViscosity(viscFromConfig(D));
+      applyColor(CONFIG.liquid.color);
+      $('sAbs').value = CONFIG.liquid.absorb;
+      $('vAbs').textContent = CONFIG.liquid.absorb.toFixed(1);
+      $('sBub').value = CONFIG.sim.cohesionLiq;
+      $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
+      for (const o of $('segEnv').children) {
+        o.setAttribute('aria-pressed', String(o.dataset.env === CONFIG.env.preset));
+      }
+      Gpu.buildEnv(CONFIG.env.preset);
+      Sim.reseed(Gpu.dev);
+      st = {}; save();
+      const b = $('bDefault');
+      b.textContent = '既定に戻しました';
+      setTimeout(() => { b.textContent = '設定を既定に戻す'; }, 2000);
+    };
+
+    $('bSensor').onclick = async () => {
+      const ok = await Gravity.enableSensors();
+      $('bSensor').textContent = ok ? '傾きを使っています' : '傾きを使えませんでした';
+      setTimeout(() => { $('bSensor').textContent = 'スマホの傾きを使う'; }, 2600);
+    };
+
+    // パネルの外を触ったら閉じる
+    addEventListener('pointerdown', (e) => {
+      if (!isOpen) return;
+      if (e.target.closest && e.target.closest('#panel, #gear')) return;
+      toggle(false);
+    }, { passive:true });
+    addEventListener('pointerdown', dimSoon, { passive:true });
+    dimSoon();
+
+    // --- センサーの許可 ---
+    // iOS は利用者の操作がないと許可を求められないので、タッチ端末のときだけ
+    // 起動時に一度だけ聞く。パソコンでは出さず、パネルのボタンから使える。
+    const boot  = $('boot');
+    const touch = matchMedia('(pointer: coarse)').matches;
+    if (touch && Gravity.needsPermission()) {
+      boot.classList.add('show');
+      $('bootOk').onclick = async () => {
+        await Gravity.enableSensors();
+        boot.classList.remove('show');
+      };
+    } else if (touch) {
+      Gravity.enableSensors();
+    }
+  }
+
+  return { init, toggle };
+})();
+
+(async () => {
+  if (DEBUG) hud.hidden = false;
+  try {
+    resize();
+    buildShape(aspect);     // 画面の比率が分かってから容器を作る
+    await Gpu.init(canvas);
+    Gpu.resize(renderW, renderH);
+    UI.init();
+    addEventListener('resize', resize);
+    requestAnimationFrame((t) => { lastT = t; frame(t); });
+  } catch (e) {
+    showError(e.message || String(e), e.stack && e.message !== e.stack ? e.stack : '');
+  }
+})();
+
+</script>
+</body>
+</html>
