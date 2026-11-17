@@ -198,6 +198,11 @@
   </div>
 
   <div class="row">
+    <label>動きの速さ <b id="vSpd"></b></label>
+    <input type="range" id="sSpd" min="0.1" max="1" step="0.05">
+  </div>
+
+  <div class="row">
     <label>界面の張り <b id="vBub"></b></label>
     <input type="range" id="sBub" min="0.2" max="4.0" step="0.05">
   </div>
@@ -294,6 +299,10 @@ const CONFIG = {
     ior    : 1.47,
     color  : [0.90, 0.95, 0.98],  // この色が残る（= 補色が吸収される）
     absorb : 3.0,                 // 既定はほぼ無色透明（うっすら色がつく程度）
+    // 色のつき方。実物は液全体に同じ色がついていて、薄い所（落ちる紐やしずく）でも
+    // 色が薄くならない。そこで、通った距離に比例して色を吸わせるのではなく、
+    // 視線が液に入ったら一度だけ、この長さぶんの色を一定にかける
+    tintLen: 0.3,
   },
 
   // --- レイマーチの打ち切り ---
@@ -340,6 +349,8 @@ const CONFIG = {
   sim: {
     particles : 0,       // 目標粒子数。0 なら端末を見て決める
     substeps  : 1,       // 1フレームあたりの物理ステップ
+    speed     : 0.5,     // 動きの速さ（パネルの「動きの速さ」）。物理を進めるコマの割合で、
+                         // 0.5 なら2コマに1回進める。1 だと実物よりかなり速く落ちる
     iters     : 5,       // 密度拘束の反復回数。
                          // 閉じた容器では圧力が伝わるのに反復が要る
     hFactor   : 2.0,     // 平滑化半径 = hFactor × 粒子間隔
@@ -2404,7 +2415,7 @@ struct Uni {
   camUp    : vec4f,   // xyz = カメラ上, w = アスペクト比
   camFwd   : vec4f,   // xyz = カメラ前
   camPos   : vec4f,   // xyz = カメラ位置, w = 時刻
-  grav     : vec4f,   // xyz = 重力の逆向き
+  grav     : vec4f,   // xyz = 重力の逆向き, w = 液の色をかける長さ（一定）
   liqA     : vec4f,   // rgb = 液体に残る色, a = 吸収の強さ
   glsA     : vec4f,   // rgb = ガラスに残る色, a = 吸収の強さ
   mat      : vec4f,   // x = ガラス屈折率, y = 液体屈折率, z = ガラス粗さ, w = 露出
@@ -2906,6 +2917,7 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
   // すれすれの角度で屈折したレイは大きく広がる。そのぶん環境マップを
   // ぼかして拾わないと、細い光源を拾って壁ぎわがギラつく。
   var spread = 0.0;
+  var tinted = false;
 
   let gExt = U.glsA.a*(vec3f(1.0, 1.0, 1.0) - U.glsA.rgb);
   let lExt = U.liqA.a*(vec3f(1.0, 1.0, 1.0) - U.liqA.rgb);
@@ -2921,7 +2933,7 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
       if (t > SEGMAX) { break; }
     }
     if (med == MED_GLASS)    { thr *= exp(-gExt*t); }
-    else if (med == MED_LIQ) { thr *= exp(-lExt*t); }
+
 
     if (!hit) {
       if (med == MED_OUT) { rad += thr*sceneCol(pos, dir, spread*U.bnd.z); }
@@ -2973,6 +2985,8 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
 
     dir = normalize(eta*dir + (eta*cosi - sqrt(kk))*nrm);
     pos = pos + dir*(EPS*4.0);
+    // 液の色。厚みによらず、視線が液に入ったら一度だけ同じ濃さでかける
+    if (medNext == MED_LIQ && !tinted) { thr *= exp(-lExt*U.grav.w); tinted = true; }
     med = medNext;
 
     if (med == MED_OUT) {
@@ -3488,12 +3502,16 @@ const Sim = {
       }
       pass.end();
     }
+  },
 
-    // 描画用の位置をならす
+  // 描画用の位置をならす（毎フレーム）。物理を進めないコマでも位置が少しずつ追いつくので、
+  // 動きの速さを落としてコマを間引いても、動きがカクつかない
+  followRender(enc){
+    if (!this.ready) return;
     const rp = enc.beginComputePass();
     rp.setPipeline(this.pRender);
     rp.setBindGroup(0, this.bgRender);
-    rp.dispatchWorkgroups(wgP);
+    rp.dispatchWorkgroups(Math.ceil(this.N/64));
     rp.end();
   },
 
@@ -3814,8 +3832,9 @@ const Gpu = {
     const dev = this.dev;
     const enc = dev.createCommandEncoder();
 
-    // 1) 流体を進める
-    Sim.step(dev, enc, dt, gravityDir);
+    // 1) 流体を進める（dt が 0 のコマは進めない）
+    if (dt > 0) Sim.step(dev, enc, dt, gravityDir);
+    Sim.followRender(enc);
     Sim.gridDraw(enc);
 
     const col = (view, clear) => ({ view, loadOp:'clear', storeOp:'store', clearValue: clear });
@@ -3982,7 +4001,7 @@ function writeUniforms(time){
   const VIEWS = { phase: 1, gas: 2, liq: 3 };
   U[56]=F[0];  U[57]=F[1];  U[58]=F[2];  U[59]=VIEWS[QS.get('view')] || 0;
   U[60]=P[0];  U[61]=P[1];  U[62]=P[2];  U[63]=time;
-  U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=0;
+  U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=L.tintLen;
   U[68]=L.color[0]; U[69]=L.color[1]; U[70]=L.color[2]; U[71]=L.absorb;
   U[72]=G.color[0]; U[73]=G.color[1]; U[74]=G.color[2]; U[75]=G.absorb;
   U[76]=G.ior; U[77]=L.ior; U[78]=G.roughness; U[79]=CONFIG.view.exposure;
@@ -4006,6 +4025,7 @@ function writeUniforms(time){
 }
 
 const Perf = { t:0, n:0, fps:0, ms:0 };
+const SimClock = { acc: 0 };   // 物理を進める時間の貯め
 let lastT = 0;
 
 function frame(now){
@@ -4017,7 +4037,12 @@ function frame(now){
   resize();
   Gravity.update(dt);
   writeUniforms(now/1000);
-  const dtSim = Math.min(dt, 1/45);
+  // 物理の刻みは 1/45 秒に固定し、動きの速さはコマを間引いて落とす。
+  // 刻みそのものを小さくすると、計算の釣り合いが崩れて液が一気に崩れ落ちることがあった
+  // （刻み 0.75 倍で発生）。間引けば物理は同じままで、計算も軽くなる
+  SimClock.acc = Math.min(SimClock.acc + Math.min(dt, 1/45)*CONFIG.sim.speed, 2/45);
+  let dtSim = 0;
+  if (SimClock.acc >= 1/45 - 1e-6) { dtSim = 1/45; SimClock.acc -= 1/45; }
   TSIM.t += dtSim;
   Gpu.render(dtSim, Gravity.down);
 
@@ -4155,6 +4180,9 @@ const UI = (() => {
     $('vAbs').textContent = CONFIG.liquid.absorb.toFixed(1);
     $('sBub').value = CONFIG.sim.cohesionLiq;
     $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
+    CONFIG.sim.speed = st.speed ?? CONFIG.sim.speed;
+    $('sSpd').value = CONFIG.sim.speed;
+    $('vSpd').textContent = CONFIG.sim.speed.toFixed(2);
     if (st.env && ENV_PRESETS[st.env] !== undefined) CONFIG.env.preset = st.env;
     for (const b of $('segEnv').children) {
       b.setAttribute('aria-pressed', String(b.dataset.env === CONFIG.env.preset));
@@ -4177,6 +4205,11 @@ const UI = (() => {
       st.absorb = CONFIG.liquid.absorb; save();
     };
     $('sVis').oninput = (e) => { setViscosity(+e.target.value); st.visc = +e.target.value; save(); };
+    $('sSpd').oninput = (e) => {
+      CONFIG.sim.speed = +e.target.value;
+      $('vSpd').textContent = CONFIG.sim.speed.toFixed(2);
+      st.speed = CONFIG.sim.speed; save();
+    };
     $('sBub').oninput = (e) => {
       CONFIG.sim.cohesionLiq = +e.target.value;
       $('vBub').textContent = CONFIG.sim.cohesionLiq.toFixed(2);
@@ -4205,6 +4238,9 @@ const UI = (() => {
       CONFIG.liquid.color  = D.liquid.color.slice();
       CONFIG.liquid.absorb = D.liquid.absorb;
       CONFIG.sim.cohesionLiq = D.sim.cohesionLiq;
+      CONFIG.sim.speed     = D.sim.speed;
+      $('sSpd').value = CONFIG.sim.speed;
+      $('vSpd').textContent = CONFIG.sim.speed.toFixed(2);
       CONFIG.env.preset    = D.env.preset;
       setViscosity(viscFromConfig(D));
       applyColor(CONFIG.liquid.color);
