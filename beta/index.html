@@ -268,6 +268,17 @@ const CONFIG = {
                             // 凹凸が消えてつながった液体に見える。
     maxDpr        : 2,      // 解像度の上限（レイマーチが重いので抑える）
     exposure      : 0.92,
+
+    // 液の形は、粒子を立体の格子に溜めた「液の濃さ」の場から作る（毎フレーム）。
+    // 濃さが volIso を超える所が液。泡も紐もしずくも、粒子の並びがそのまま形になる。
+    // 画面の奥行きだけで液を表すと、液の中の泡のような「中に空いた穴」が表せず、
+    // 泡を球に置き換えるしかなかった。
+    volVoxel      : 0.75,   // 格子の幅（粒子間隔の倍数）
+    volKernel     : 2.4,    // 1粒子が濃さを広げる半径（粒子間隔の倍数）。大きいほど面がなめらか
+    volIso        : 0.5,    // 液とみなす濃さ（液の中ほどが 1）
+    volSolo       : 0.8,    // 離れた1粒子を、この半径（粒子間隔の倍数）のしずくとして残す。
+                            // 濃さを足し合わせるだけだと、数粒子の小さなしずくは
+                            // 液とみなす濃さに届かず消えてしまう（落ちる液が見えなくなる）
   },
 
   // --- 容器（アクリル樹脂）---
@@ -283,17 +294,14 @@ const CONFIG = {
     ior    : 1.47,
     color  : [0.90, 0.95, 0.98],  // この色が残る（= 補色が吸収される）
     absorb : 3.0,                 // 既定はほぼ無色透明（うっすら色がつく程度）
-    // 液の中を通る距離は、短くてもこの長さ（筒の内径の約半分）として色を吸わせる。
-    // 吸収は通った距離だけで決まるので、そのままだと落ちる紐や下に溜まった薄い液は
-    // ほとんど色がつかず、上の液とは別のものに見える
-    tintMin: 0.25,
   },
 
   // --- レイマーチの打ち切り ---
   march: {
     glassHit  : 72,     // ガラス前面を探す
     inGlass   : 36,     // ガラスの中を抜ける
-    cavity    : 56,     // 空洞の中を進む（液面か背面ガラスまで）
+    cavity    : 120,    // 空洞の中を進む（液面か背面ガラスまで）。液の形を濃さの場から
+                        // 探すので、格子の幅くらいずつしか進めない
     inLiquid  : 64,     // 液体の中を抜ける
     eps       : 0.0010,
     normalEps : 0.0015,
@@ -406,7 +414,9 @@ const CONFIG = {
     // 実物では表面張力が空気を穴の出口に溜めて、ある大きさになると1個の泡として離す。
     // その役目を球で代わりにする。穴を下った液の量を数え、泡1個ぶんになるたびに
     // 出口に球を置く。球は液体の粒子を外へ押し出すので、まわりのすき間がそこへ集まる。
-    bubbleR   : 2.4,     // 泡の半径（粒子間隔の倍数）。0 で泡を作らない
+    // 既定では使わない。泡の形を球に決めてしまい、シミュレーションの結果ではなくなるため。
+    // ?sim.bubbleR=2.4 で試せる
+    bubbleR   : 0,       // 泡の半径（粒子間隔の倍数）。0 で泡を作らない
     bubbleRise: 0.066,   // 泡が昇る速さ（格子に任せたときのすき間の速さに合わせてある）
     bubblePush: 0.5,     // 球の中の粒子を1ステップで外へ戻す割合。0 なら見た目だけの泡
   },
@@ -2394,7 +2404,7 @@ struct Uni {
   camUp    : vec4f,   // xyz = カメラ上, w = アスペクト比
   camFwd   : vec4f,   // xyz = カメラ前
   camPos   : vec4f,   // xyz = カメラ位置, w = 時刻
-  grav     : vec4f,   // xyz = 重力の逆向き, w = 液の中を通る距離の下限（色の吸収用）
+  grav     : vec4f,   // xyz = 重力の逆向き
   liqA     : vec4f,   // rgb = 液体に残る色, a = 吸収の強さ
   glsA     : vec4f,   // rgb = ガラスに残る色, a = 吸収の強さ
   mat      : vec4f,   // x = ガラス屈折率, y = 液体屈折率, z = ガラス粗さ, w = 露出
@@ -2557,6 +2567,100 @@ struct EnvU { face: u32, preset: u32, lobe: f32, pad: f32 };
 }
 `;
 
+
+/* ==========================================================================
+   VOLUME — 粒子から「液の濃さ」の立体の場を作る（描画用）
+   --------------------------------------------------------------------------
+   粒子1つが半径 R の中に濃さを広げ、格子に足し込む。液の中ほどで 1 になるよう
+   正規化してある。壁ぎわは壁の向こうに粒子がないぶん薄くなるので、
+   「その点のまわりで空洞に入っている割合」（最初に1回だけ式で求める）で割って戻す。
+   これをしないと、液と壁のあいだに薄い空気の膜があるように見える。
+   ========================================================================== */
+function buildVolWGSL(shape){
+  const shapeSrc = buildShapeSource(shape, 'wgsl');
+  return `
+struct VolU {
+  dim : vec4u,   // xyz = 格子の数, w = 粒子の数
+  org : vec4f,   // xyz = 格子の角, w = 格子の幅
+  ker : vec4f,   // x = 半径 R, y = 1粒子の重みの係数, z = 1/R², w = 液とみなす濃さ
+  solo: vec4f,   // x = 1粒子だけのときの濃さの係数
+};
+@group(0) @binding(0) var<uniform> VL: VolU;
+@group(0) @binding(1) var<storage, read> parts: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> acc: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> cov: array<f32>;
+@group(0) @binding(4) var vol: texture_storage_3d<rgba16float, write>;
+
+const FIX : f32 = 65536.0;
+
+${SDF_LIB_WGSL}
+${shapeSrc}
+
+fn nVox() -> u32 { return VL.dim.x*VL.dim.y*VL.dim.z; }
+fn vox(i: u32) -> vec3u {
+  return vec3u(i % VL.dim.x, (i / VL.dim.x) % VL.dim.y, i / (VL.dim.x*VL.dim.y));
+}
+fn voxCenter(c: vec3u) -> vec3f { return VL.org.xyz + (vec3f(c) + vec3f(0.5))*VL.org.w; }
+
+@compute @workgroup_size(64)
+fn vClear(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x < nVox()) { atomicStore(&acc[g.x], 0u); atomicStore(&acc[nVox() + g.x], 0u); }
+}
+
+@compute @workgroup_size(64)
+fn vSplat(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= VL.dim.w) { return; }
+  let p  = parts[g.x].xyz;
+  let vs = VL.org.w;
+  let a  = (p - VL.org.xyz)/vs - vec3f(0.5);
+  let r  = VL.ker.x/vs;
+  let lo = max(vec3i(ceil(a - vec3f(r))), vec3i(0));
+  let hi = min(vec3i(floor(a + vec3f(r))), vec3i(VL.dim.xyz) - vec3i(1));
+  for (var z = lo.z; z <= hi.z; z++) {
+    for (var y = lo.y; y <= hi.y; y++) {
+      for (var x = lo.x; x <= hi.x; x++) {
+        let d  = (vec3f(f32(x), f32(y), f32(z)) - a)*vs;
+        let q2 = dot(d, d)*VL.ker.z;
+        if (q2 < 1.0) {
+          let w = 1.0 - q2;
+          let i = (u32(z)*VL.dim.y + u32(y))*VL.dim.x + u32(x);
+          atomicAdd(&acc[i], u32(w*w*w*VL.ker.y*FIX));
+          atomicMax(&acc[nVox() + i], u32(w*w*w*FIX));   // いちばん近い1粒子だけの濃さ
+        }
+      }
+    }
+  }
+}
+
+// その点のまわり（半径 R）のうち、空洞に入っている割合。最初に1回だけ。
+// 壁を平らな面とみなし、重み (1−q²)³ を面で切った残りを式で求める
+// （面からの距離 x の薄い板の重みは (1−x²)⁴ に比例する）。角では少しずれるが十分
+fn cutF(x: f32) -> f32 {
+  let x2 = x*x;
+  return x*(1.0 + x2*(-4.0/3.0 + x2*(6.0/5.0 + x2*(-4.0/7.0 + x2/9.0))));
+}
+@compute @workgroup_size(64)
+fn vCov(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= nVox()) { return; }
+  let h = clamp(-sdCavity(voxCenter(vox(g.x)))/VL.ker.x, -1.0, 1.0);
+  cov[g.x] = (cutF(h) - cutF(-1.0))/(cutF(1.0) - cutF(-1.0));
+}
+
+@compute @workgroup_size(64)
+fn vResolve(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= nVox()) { return; }
+  let a  = f32(atomicLoad(&acc[g.x]))/FIX;
+  let cv = cov[g.x];
+  var ph = 0.0;
+  if (cv > 0.05) {
+    let solo = f32(atomicLoad(&acc[nVox() + g.x]))/FIX*VL.solo.x;
+    ph = min(max(a/max(cv, 0.2), solo), 2.0);
+  }
+  textureStore(vol, vox(g.x), vec4f(ph, 0.0, 0.0, 0.0));
+}
+`;
+}
+
 // --- 本体: ガラス・空気・液体を統一的に扱うレイマーチャ ---
 //
 //   3つの媒質（ガラス / 空洞の空気 / 液体）を符号付き距離関数で表し、
@@ -2572,12 +2676,10 @@ function buildMainWGSL(shape){
 ${WGSL_UNI}
 @group(0) @binding(1) var envTex: texture_cube<f32>;
 @group(0) @binding(2) var smp: sampler;
-@group(0) @binding(3) var liqDepth: texture_2d<f32>;
-@group(0) @binding(4) var liqThick: texture_2d<f32>;
-@group(0) @binding(5) var gasDepth: texture_2d<f32>;
-@group(0) @binding(6) var gasThick: texture_2d<f32>;
-// 泡（物理の gsBubble と同じ配列）。xyz 中心, w 半径（0 は空き）
-@group(0) @binding(7) var<storage, read> bubs: array<vec4f>;
+// 液の濃さの立体の場（VOLUME を参照）
+@group(0) @binding(7) var volTex: texture_3d<f32>;
+struct VolU { dim: vec4u, org: vec4f, ker: vec4f, solo: vec4f };
+@group(0) @binding(8) var<uniform> VL: VolU;
 
 const EPS   : f32 = ${f(M.eps)};
 const NEPS  : f32 = ${f(M.normalEps)};
@@ -2593,96 +2695,29 @@ const MED_LIQ   : i32 = 3;
 ${SDF_LIB_WGSL}
 ${shapeSrc}
 
-// --- 液体は画面空間で表す ---
-// 粒子を球として描いた深度（前面）と厚みから、液体を「深度方向のスラブ」とみなす。
-// 視線から少しずれたレイでも、投影しなおして同じ表を引けるので、
-// 屈折したレイの追跡をそのまま続けられる。
-fn projUV(p: vec3f) -> vec3f {           // xy = uv(y上), z = ビュー深度
-  let c = U.viewProj*vec4f(p, 1.0);
-  if (c.w <= 1e-6) { return vec3f(-1.0, -1.0, -1.0); }
-  return vec3f(c.xy/c.w*0.5 + vec2f(0.5, 0.5), c.w);
+// --- 液の形 ---
+// 粒子から作った「液の濃さ」の場を、格子の間をなめらかにつないで引く。
+// 濃さが VL.ker.w を超える所が液。泡も紐もしずくも、この場の形そのまま。
+fn phiAt(p: vec3f) -> f32 {
+  let uvw = (p - VL.org.xyz)/(vec3f(VL.dim.xyz)*VL.org.w);
+  return textureSampleLevel(volTex, smp, uvw, 0.0).r;
 }
-fn texel(uv: vec2f) -> vec2i {
-  let r = U.fres.xy;
-  return vec2i(clamp(vec2f(uv.x, 1.0 - uv.y)*r, vec2f(0.0), r - vec2f(1.0)));
+// 濃さの勾配。液の外向きの法線はこの逆向き
+fn gradPhi(p: vec3f) -> vec3f {
+  let e = VL.org.w;
+  let g = vec3f(phiAt(p + vec3f(e, 0.0, 0.0)) - phiAt(p - vec3f(e, 0.0, 0.0)),
+                phiAt(p + vec3f(0.0, e, 0.0)) - phiAt(p - vec3f(0.0, e, 0.0)),
+                phiAt(p + vec3f(0.0, 0.0, e)) - phiAt(p - vec3f(0.0, 0.0, e)));
+  let l = length(g);
+  if (l < 1e-6) { return vec3f(0.0, 1.0, 0.0); }
+  return g/l;
 }
-// 相ごとの「前面の深度」と「厚み」。厚みは半解像度で線形に読むので段差が出ない。
-fn liqAtUV(uv: vec2f) -> vec2f {
-  return vec2f(textureLoad(liqDepth, texel(uv), 0).r,
-               textureSampleLevel(liqThick, smp, vec2f(uv.x, 1.0 - uv.y), 0.0).r);
-}
-fn gasAtUV(uv: vec2f) -> vec2f {
-  return vec2f(textureLoad(gasDepth, texel(uv), 0).r,
-               textureSampleLevel(gasThick, smp, vec2f(uv.x, 1.0 - uv.y), 0.0).r);
-}
-// 視線方向の距離なので、斜めの面で踏み越えないよう安全側に縮める。
-// zb を渡すことで、スラブの奥側を手前の相の手前で打ち切れる。
-fn slabDist(zf: f32, zb: f32, z: f32) -> f32 {
-  return max(zf - z, z - zb)*0.45;
-}
+// 濃さの差を、面までのおおよその距離に直す係数（面の近くで濃さは半径 R ほどで 0→1 に変わる）。
+// 小さめにして、細い紐を踏み越えないようにする
+fn phiDist(ph: f32) -> f32 { return (VL.ker.w - ph)*VL.ker.x*0.9; }
 
-fn viewPosAt(uv: vec2f, z: f32) -> vec3f {
-  let ndc = uv*2.0 - vec2f(1.0, 1.0);
-  return vec3f(ndc.x*U.camRight.w*U.camUp.w*z, ndc.y*U.camRight.w*z, -z);
-}
-fn toWorldN(n: vec3f) -> vec3f {
-  return normalize(U.camRight.xyz*n.x + U.camUp.xyz*n.y - U.camFwd.xyz*n.z);
-}
-// 深度の差分から面の法線を起こす。前後どちらか近いほうの差分を採って輪郭を保つ。
-fn normalFromDepth(q: vec3f, isGas: bool) -> vec3f {
-  // 1画素の差分だと粒ひとつぶんの膨らみがそのまま法線に出て、
-  // つながった液体ではなく玉の集まりに見えてしまう。
-  // 粒の見かけの大きさに合わせて差分の幅を広げ、面として均す。
-  let e = U.fres.zw*max(U.fluid.z*0.60, 2.0);
-  var z   = 0.0; var zx1 = 0.0; var zx0 = 0.0; var zy1 = 0.0; var zy0 = 0.0;
-  if (isGas) {
-    z   = gasAtUV(q.xy).x;
-    zx1 = gasAtUV(q.xy + vec2f(e.x, 0.0)).x;
-    zx0 = gasAtUV(q.xy - vec2f(e.x, 0.0)).x;
-    zy1 = gasAtUV(q.xy + vec2f(0.0, e.y)).x;
-    zy0 = gasAtUV(q.xy - vec2f(0.0, e.y)).x;
-  } else {
-    z   = liqAtUV(q.xy).x;
-    zx1 = liqAtUV(q.xy + vec2f(e.x, 0.0)).x;
-    zx0 = liqAtUV(q.xy - vec2f(e.x, 0.0)).x;
-    zy1 = liqAtUV(q.xy + vec2f(0.0, e.y)).x;
-    zy0 = liqAtUV(q.xy - vec2f(0.0, e.y)).x;
-  }
-  let P  = viewPosAt(q.xy, z);
-  var dx = viewPosAt(q.xy + vec2f(e.x, 0.0), zx1) - P;
-  if (abs(zx0 - z) < abs(zx1 - z)) { dx = P - viewPosAt(q.xy - vec2f(e.x, 0.0), zx0); }
-  var dy = viewPosAt(q.xy + vec2f(0.0, e.y), zy1) - P;
-  if (abs(zy0 - z) < abs(zy1 - z)) { dy = P - viewPosAt(q.xy - vec2f(0.0, e.y), zy0); }
-  var n = cross(dx, dy);
-  let l = length(n);
-  if (l < 1e-12) { return -U.camFwd.xyz; }
-  n = n/l;
-  if (n.z < 0.0) { n = -n; }
-  return toWorldN(n);
-}
-
-// body = 容器, liq = 液体（空気をくり抜いたもの）, cav = 空洞,
-// liqS = 液体のスラブ, gasS = 空気のスラブ
-// bub = 泡（球）までの距離, bubN = いちばん近い泡の中心から外向きの向き
-struct FD { body: f32, liq: f32, cav: f32, liqS: f32, gasS: f32, bub: f32, bubN: vec3f };
-
-// 泡は画面空間のスラブではなく、本物の球として持つ。
-// 面の向きが正確に出るので、縁の全反射や中の景色の反転がくっきり見える
-fn bubbleDist(p: vec3f, f: ptr<function, FD>) {
-  (*f).bub = 1.0;
-  (*f).bubN = vec3f(0.0, 1.0, 0.0);
-  for (var b = 0u; b < 16u; b++) {
-    let q = bubs[b];
-    if (q.w <= 0.0) { continue; }
-    let v = p - q.xyz;
-    let l = length(v);
-    let d = l - q.w;
-    if (d < (*f).bub) {
-      (*f).bub = d;
-      (*f).bubN = select(vec3f(0.0, 1.0, 0.0), v/l, l > 1e-6);
-    }
-  }
-}
+// body = 容器, liq = 液体, cav = 空洞, lq = 濃さから決めた液の面までの距離
+struct FD { body: f32, liq: f32, cav: f32, lq: f32 };
 
 fn fields(p: vec3f) -> FD {
   var f: FD;
@@ -2690,35 +2725,11 @@ fn fields(p: vec3f) -> FD {
   let c = sdCavity(p);
   f.cav  = c;
   f.body = max(o, -c);
-  // 空洞の外に中身はないので、重い画面空間の判定を省く
-  f.bub = 1.0; f.bubN = vec3f(0.0, 1.0, 0.0);
-  if (c > 0.0) { f.liqS = 1.0; f.gasS = 1.0; f.liq = c; return f; }
-
-  let q = projUV(p);
-  var liqS = 1.0;
-  var gasS = 1.0;
-  if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
-    let L = liqAtUV(q.xy);
-    let G = gasAtUV(q.xy);
-    let hasL = L.x < U.fluid.w*0.5;
-    let hasG = G.x < U.fluid.w*0.5;
-    // 薄いところでも最低限の奥行きを持たせる（薄すぎると点滅する）
-    let tmin = U.fluid.x*1.8;
-    if (hasL) { liqS = slabDist(L.x, L.x + max(L.y, tmin), q.z); }
-    if (hasG) {
-      var zb = G.x + max(G.y, tmin);
-      // 気体より奥から液体が始まるなら、気体はそこで終わる。
-      // ここを打ち切らないと、気体の中を落ちる細い筋が気体に覆い隠されて
-      // 見えなくなる（液体がワープして見える原因）。
-      if (hasL && L.x > G.x) { zb = min(zb, L.x); }
-      gasS = slabDist(G.x, zb, q.z);
-    }
-  }
-  f.liqS = liqS;
-  f.gasS = gasS;
-  // 液体 = 空洞 ∩ 液体スラブ ∩ ¬空気スラブ ∩ ¬泡
-  bubbleDist(p, &f);
-  f.liq  = max(max(max(c, liqS), -gasS), -f.bub);
+  // 空洞の外に中身はないので、濃さを引くのを省く
+  if (c > 0.0) { f.lq = 1.0; f.liq = c; return f; }
+  f.lq  = phiDist(phiAt(p));
+  // 液体 = 空洞 ∩ 濃い所
+  f.liq = max(c, f.lq);
   return f;
 }
 fn ifaceDist(p: vec3f) -> f32 {
@@ -2762,21 +2773,57 @@ fn envS(d: vec3f, mip: f32) -> vec3f {
   return textureSampleLevel(envTex, smp, d, clamp(mip, 0.0, U.bnd.z)).rgb;
 }
 
-// 直接見える背景。照明用の環境マップとは別に作る。
-// 環境マップは反射と透過のために明るくしておき、背景だけを落ち着いた暗さにすると、
-// 暗い背景の中でオブジェだけが光を通して見える（撮影スタジオと同じ考え方）。
-fn bgColor(d: vec3f) -> vec3f {
-  let h = clamp(d.y*0.5 + 0.5, 0.0, 1.0);
-  var c = mix(vec3f(0.017, 0.020, 0.027), vec3f(0.052, 0.059, 0.076), smoothstep(0.28, 1.0, h));
-  if (d.y < -0.004) {
-    let t = -1.12/d.y;
-    let p = d*t;
-    let r = length(p.xz);
-    var fl = mix(vec3f(0.082, 0.088, 0.100), vec3f(0.014, 0.016, 0.022), smoothstep(0.35, 5.0, r));
-    fl *= mix(0.14, 1.0, smoothstep(0.13, 1.05, r));    // 接地の影
-    c = mix(c, fl, smoothstep(-0.004, -0.055, d.y));
+// --- 背景 ---
+// 容器の後ろにタイル張りの壁と床を置く。直接見える背景と、容器を抜けた光が
+// 拾う景色を同じものにするので、液や泡ごしにタイルの目地が曲がって見え、
+// 屈折がそのまま分かる。壁と床に当たらない向き（手前や上）は環境マップを拾う。
+const WALL_Z : f32 = -1.35;   // 壁の位置（容器の中心から奥へ）
+const TILE   : f32 = 0.20;    // タイルの大きさ
+const GROUT  : f32 = 0.006;   // 目地の半幅
+
+fn tileMask(q: vec2f) -> f32 {
+  let g = abs(fract(q/TILE + vec2f(0.5)) - vec2f(0.5))*TILE;   // 目地の中心からの距離
+  let m = min(g.x, g.y);
+  return smoothstep(GROUT, GROUT*1.8, m);                     // 1 = タイル, 0 = 目地
+}
+// 光は左上の手前から（環境マップの大きな面光源と同じ向き）
+fn wallCol(q: vec2f) -> vec3f {
+  let lit = 0.55 + 0.45*exp(-dot(q - vec2f(-0.9, 1.1), q - vec2f(-0.9, 1.1))*0.18);
+  let tile  = vec3f(0.30, 0.31, 0.33)*lit;
+  let grout = vec3f(0.13, 0.135, 0.145)*lit;
+  return mix(grout, tile, tileMask(q));
+}
+// p から d の向きに進んで壁か床に当たれば、その色を返す。当たらなければ負の値
+fn backdrop(p: vec3f, d: vec3f) -> vec3f {
+  let fy = -U.bnd.y;                               // 床の高さ（容器の底）
+  var tf = 1e9;
+  var tw = 1e9;
+  if (d.y < -1e-5) { tf = (fy - p.y)/d.y; }
+  if (d.z < -1e-5) { tw = (WALL_Z - p.z)/d.z; }
+  if (tf < 0.0) { tf = 1e9; }
+  if (tw < 0.0) { tw = 1e9; }
+  if (tw < tf && tw < 1e8) {
+    let h = p + d*tw;
+    if (h.y >= fy) { return wallCol(h.xy); }
   }
-  return c;
+  if (tf < 1e8) {
+    let h = p + d*tf;
+    if (h.z >= WALL_Z) {
+      // 床もタイル。壁の目地と揃え、奥行き方向は壁から数える
+      var c = wallCol(vec2f(h.x, fy + (h.z - WALL_Z)))*0.85;
+      // 容器の真下の柔らかい影
+      let r = length(h.xz);
+      c *= mix(0.35, 1.0, smoothstep(U.bnd.x*0.9, U.bnd.x*2.6, r));
+      return c;
+    }
+  }
+  return vec3f(-1.0);
+}
+// 景色。壁と床が見えればそれを、見えなければ環境マップを拾う
+fn sceneCol(p: vec3f, d: vec3f, mip: f32) -> vec3f {
+  let b = backdrop(p, d);
+  if (b.x >= 0.0) { return b*U.bnd.w; }
+  return envS(d, mip);
 }
 fn f0of(n1: f32, n2: f32) -> f32 { let r = (n1 - n2)/(n1 + n2); return r*r; }
 fn fres(f0: f32, c: f32) -> f32 {
@@ -2813,13 +2860,30 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
 }
 
 @fragment fn fsMain(i: VO) -> @location(0) vec4f {
+  let ndc = i.uv*2.0 - vec2f(1.0, 1.0);
+  let rd0 = normalize(U.camFwd.xyz
+          + U.camRight.xyz*(ndc.x*U.camRight.w*U.camUp.w)
+          + U.camUp.xyz   *(ndc.y*U.camRight.w));
+  let ro  = U.camPos.xyz;
+
   // 確認用: 相を色分けして見る（?view=phase）。屈折を通さないので物理だけを見られる。
+  // 視線に沿って液の濃さを足し合わせるので、液の中の泡も見える
   if (U.camFwd.w > 0.5) {
-    let L = liqAtUV(i.uv);
-    let G = gasAtUV(i.uv);
-    // 厚みを足し合わせるので、液体の中にある泡も見える
-    var tl = select(0.0, min(L.y*1.9, 1.3), L.x < U.fluid.w*0.5);
-    var tg = select(0.0, min(G.y*1.9, 1.3), G.x < U.fluid.w*0.5);
+    let hc = hitCyl(ro, rd0, U.bnd.x, U.bnd.y);
+    var tl = 0.0;
+    var tg = 0.0;
+    if (hc.x >= 0.0) {
+      let n  = 96;
+      let dt = (hc.y - hc.x)/f32(n);
+      for (var k = 0; k < n; k++) {
+        let q = ro + rd0*(hc.x + (f32(k) + 0.5)*dt);
+        if (sdCavity(q) < 0.0) {
+          let ph = select(0.0, 1.0, phiAt(q) > VL.ker.w);
+          tl += ph*dt; tg += (1.0 - ph)*dt;
+        }
+      }
+    }
+    tl = min(tl*2.4, 1.3); tg = min(tg*2.4, 1.3);
     if (U.camFwd.w > 2.5) { tg = 0.0; }        // 液相だけ
     else if (U.camFwd.w > 1.5) { tl = 0.0; }   // 気相だけ
     let c = vec3f(0.015, 0.018, 0.028)
@@ -2828,15 +2892,9 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
     return vec4f(c, 1.0);
   }
 
-  let ndc = i.uv*2.0 - vec2f(1.0, 1.0);
-  let rd0 = normalize(U.camFwd.xyz
-          + U.camRight.xyz*(ndc.x*U.camRight.w*U.camUp.w)
-          + U.camUp.xyz   *(ndc.y*U.camRight.w));
-  let ro  = U.camPos.xyz;
-
   let hb = hitCyl(ro, rd0, U.bnd.x, U.bnd.y);
   if (hb.x < 0.0) {
-    return vec4f(bgColor(rd0)*U.bnd.w, 1.0);
+    return vec4f(sceneCol(ro, rd0, 0.0), 1.0);
   }
 
   var pos = ro + rd0*max(hb.x - 0.004, 0.0);
@@ -2863,18 +2921,10 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
       if (t > SEGMAX) { break; }
     }
     if (med == MED_GLASS)    { thr *= exp(-gExt*t); }
-    // 薄い液（落ちる紐、しずく、下に溜まった液）は、通った距離が短くても
-    // U.grav.w までは通ったものとして色を吸わせ、上の液と同じ色に見せる。
-    // 薄いかどうかは、その場所の液の厚み（画面の奥行き方向の合計）で決める。
-    // 区間の長さで決めると、上の部屋の泡の通り道のすき間で短く区切られた所が
-    // 濃い点になってしまう
-    else if (med == MED_LIQ) {
-      let th = liqAtUV(projUV(pos).xy).y;
-      thr *= exp(-lExt*max(t, U.grav.w - th));
-    }
+    else if (med == MED_LIQ) { thr *= exp(-lExt*t); }
 
     if (!hit) {
-      if (med == MED_OUT) { rad += thr*bgColor(dir)*U.bnd.w; }
+      if (med == MED_OUT) { rad += thr*sceneCol(pos, dir, spread*U.bnd.z); }
       else                { rad += thr*envS(dir, spread*U.bnd.z); }
       settled = true;
       break;
@@ -2887,16 +2937,10 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
     var nrm: vec3f;
     if (abs(f.body) <= abs(f.liq)) {
       nrm = gradBody(pos);                              // 容器の内壁
-    } else if (-f.bub >= max(max(f.cav, f.liqS), -f.gasS) - 1e-5) {
-      nrm = f.bubN;                                     // 泡の球面（正確な向き）
-    } else if (f.cav > -U.fluid.x*1.6) {
-      // 壁のすぐそばは必ず壁の法線を使う。画素ごとに壁と液面の法線が
-      // 切り替わると、壁ぎわに縦縞が出てしまう。
-      nrm = gradCav(pos);
-    } else if (-f.gasS >= f.liqS) {
-      nrm = normalFromDepth(projUV(pos), true);         // 泡の面
+    } else if (f.cav >= f.lq) {
+      nrm = gradCav(pos);                               // 液が壁に接している所
     } else {
-      nrm = normalFromDepth(projUV(pos), false);        // 液体の自由表面
+      nrm = -gradPhi(pos);                              // 液の面（泡・紐・しずく・液面）
     }
     if (dot(nrm, dir) > 0.0) { nrm = -nrm; }
 
@@ -2932,8 +2976,8 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
     med = medNext;
 
     if (med == MED_OUT) {
-      // 物体を抜けて背景へ。透過光は明るい環境マップから拾う
-      rad += thr*envS(dir, spread*U.bnd.z);
+      // 物体を抜けて背景へ。壁や床が見えればそれを拾う
+      rad += thr*sceneCol(pos, dir, spread*U.bnd.z);
       settled = true;
       break;
     }
@@ -3586,6 +3630,7 @@ const Gpu = {
       entries: [{ binding:0, resource:{ buffer: this.envUB } }] });
 
     Sim.init(dev);
+    this.initVolume(dev);
     this.bgPart = dev.createBindGroup({ layout: this.pipePartDepth.getBindGroupLayout(0),
       entries: [
         { binding:0, resource:{ buffer: this.ub } },
@@ -3688,11 +3733,8 @@ const Gpu = {
       { binding:0, resource:{ buffer: this.ub } },
       { binding:1, resource: this.envView },
       { binding:2, resource: this.smp },
-      { binding:3, resource: this.liqAView },
-      { binding:4, resource: this.thickLView },
-      { binding:5, resource: this.gasAView },
-      { binding:6, resource: this.thickGView },
-      { binding:7, resource:{ buffer: (Sim.gb && Sim.gb.bub) || this.noBub() } },
+      { binding:7, resource: this.volView },
+      { binding:8, resource:{ buffer: this.volUB } },
     ]});
     this.bgPost = dev.createBindGroup({ layout: this.pipePost.getBindGroupLayout(0), entries:[
       { binding:0, resource:{ buffer: this.ub } },
@@ -3709,10 +3751,63 @@ const Gpu = {
     this.bgSmGY = smBG(this.pipeSmoothY, this.gasBView);
   },
 
-  // 空気を粒子で持つとき（泡の配列がないとき）の空の配列
-  noBub(){
-    if (!this._noBub) this._noBub = this.dev.createBuffer({ size: 17*16, usage: GPUBufferUsage.STORAGE });
-    return this._noBub;
+  // 液の濃さの立体の場（VOLUME）。格子は空洞を囲む直方体
+  initVolume(dev){
+    const V = CONFIG.view, s = Sim.spacing, cb = SHAPE.cavityBound;
+    const vs = V.volVoxel*s, R = V.volKernel*s, m = R + vs;
+    const ext = [cb.r + m, cb.h + m, cb.r + m];
+    const dim = ext.map(e => Math.ceil(2*e/vs));
+    const nV = dim[0]*dim[1]*dim[2];
+    this.vol = { dim, nV, vs, R };
+    const buf = new ArrayBuffer(64), u = new Uint32Array(buf), f = new Float32Array(buf);
+    u[0]=dim[0]; u[1]=dim[1]; u[2]=dim[2]; u[3]=Sim.nLiquid;
+    f[4]=-ext[0]; f[5]=-ext[1]; f[6]=-ext[2]; f[7]=vs;
+    // 1粒子の重み。半径 R の中で積分すると 1、粒子間隔 s の格子に並んだ液の中ほどで 1 になる
+    f[8]=R; f[9]=315/(64*Math.PI*R*R*R)*s*s*s; f[10]=1/(R*R); f[11]=V.volIso;
+    // 1粒子だけのとき、中心から volSolo のところでちょうど液とみなす濃さになる係数
+    const qs = Math.min(0.9, V.volSolo/V.volKernel);
+    f[12]=V.volIso/Math.pow(1 - qs*qs, 3);
+    this.volUB = dev.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(this.volUB, 0, buf);
+    const st = (n) => dev.createBuffer({ size: n, usage: GPUBufferUsage.STORAGE });
+    this.volAcc = st(nV*8);   // 前半 = 濃さの合計, 後半 = いちばん近い1粒子の濃さ
+    this.volCov = st(nV*4);
+    this.volTex = dev.createTexture({ size: dim, dimension: '3d', format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+    this.volView = this.volTex.createView({ dimension: '3d' });
+    const mod = dev.createShaderModule({ code: buildVolWGSL(SHAPE), label: 'volume' });
+    const res = { 0: { buffer: this.volUB }, 1: { buffer: Sim.bufRender },
+                  2: { buffer: this.volAcc }, 3: { buffer: this.volCov }, 4: this.volView };
+    const mkp = (name, binds) => {
+      const pipeline = dev.createComputePipeline({ layout: 'auto',
+        compute: { module: mod, entryPoint: name }, label: name });
+      const bg = dev.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+        entries: binds.map(b => ({ binding: b, resource: res[b] })) });
+      return { pipeline, bg };
+    };
+    this.vp = {
+      clear  : mkp('vClear',   [0, 2]),
+      splat  : mkp('vSplat',   [0, 1, 2]),
+      cov    : mkp('vCov',     [0, 3]),
+      resolve: mkp('vResolve', [0, 2, 3, 4]),
+    };
+    // 壁ぎわの割合は空洞の形だけで決まるので、最初に1回だけ求める
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.vp.cov.pipeline); pass.setBindGroup(0, this.vp.cov.bg);
+    pass.dispatchWorkgroups(Math.ceil(nV/64));
+    pass.end();
+    dev.queue.submit([enc.finish()]);
+  },
+
+  volumePass(enc){
+    const pass = enc.beginComputePass();
+    const run = (p, n) => { pass.setPipeline(p.pipeline); pass.setBindGroup(0, p.bg); pass.dispatchWorkgroups(n); };
+    const wV = Math.ceil(this.vol.nV/64);
+    run(this.vp.clear, wV);
+    run(this.vp.splat, Math.ceil(Sim.nLiquid/64));
+    run(this.vp.resolve, wV);
+    pass.end();
   },
 
   render(dt, gravityDir){
@@ -3758,16 +3853,8 @@ const Gpu = {
       pass.end();
     };
 
-    depthPass(this.liqAView, 0, Sim.nLiquid);
-    smoothPass(this.liqBView, this.pipeSmoothX, this.bgSmLX, FARC);
-    smoothPass(this.liqAView, this.pipeSmoothY, this.bgSmLY, FARC);
-
-    depthPass(this.gasAView, Sim.nLiquid, Sim.nGas);
-    smoothPass(this.gasBView, this.pipeSmoothX, this.bgSmGX, FARC);
-    smoothPass(this.gasAView, this.pipeSmoothY, this.bgSmGY, FARC);
-
-    thickPass(this.thickLView, 0, Sim.nLiquid);
-    thickPass(this.thickGView, Sim.nLiquid, Sim.nGas);
+    // 液の形（粒子 → 立体の濃さの場）
+    this.volumePass(enc);
 
     // 本体
     {
@@ -3895,7 +3982,7 @@ function writeUniforms(time){
   const VIEWS = { phase: 1, gas: 2, liq: 3 };
   U[56]=F[0];  U[57]=F[1];  U[58]=F[2];  U[59]=VIEWS[QS.get('view')] || 0;
   U[60]=P[0];  U[61]=P[1];  U[62]=P[2];  U[63]=time;
-  U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=L.tintMin;
+  U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=0;
   U[68]=L.color[0]; U[69]=L.color[1]; U[70]=L.color[2]; U[71]=L.absorb;
   U[72]=G.color[0]; U[73]=G.color[1]; U[74]=G.color[2]; U[75]=G.absorb;
   U[76]=G.ior; U[77]=L.ior; U[78]=G.roughness; U[79]=CONFIG.view.exposure;
