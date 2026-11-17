@@ -283,6 +283,10 @@ const CONFIG = {
     ior    : 1.47,
     color  : [0.90, 0.95, 0.98],  // この色が残る（= 補色が吸収される）
     absorb : 3.0,                 // 既定はほぼ無色透明（うっすら色がつく程度）
+    // 液の中を通る距離は、短くてもこの長さ（筒の内径の約半分）として色を吸わせる。
+    // 吸収は通った距離だけで決まるので、そのままだと落ちる紐や下に溜まった薄い液は
+    // ほとんど色がつかず、上の液とは別のものに見える
+    tintMin: 0.25,
   },
 
   // --- レイマーチの打ち切り ---
@@ -1393,7 +1397,6 @@ struct GP {
 @group(0) @binding(12) var<storage, read_write> bub  : array<vec4f>;  // [0..NBUB) 泡: xyz 中心, w 半径（0 は空き）。[NBUB] x = 穴を下った液の量, y = 作った泡の数
 
 const NBUB : u32 = 16u;
-const BUB_SPH : u32 = 33u;   // 泡1つを描く球の数
 
 const SC : f32 = 1048576.0;   // 固定小数点の倍率
 const RED_PART : u32 = 16u;
@@ -2133,7 +2136,19 @@ fn gsAirDraw(@builtin(global_invocation_id) gid: vec3u) {
   if (fluid(c)) {
     let near = sdCavity(x) > -G.org.w;
     air = U[fid(c)].w < select(AIR_CELL, AIR_CELL*0.4, near);
-    // 泡のすぐまわりのセルは描かない（泡は下で丸く描く。重ねると輪郭がでこぼこになる）
+    // 液の中に取り残された小さな空気（泡の通り道のすき間など）は描かない。
+    // 泡は本体の描画で球として描くので、これを描くと灰色のでこぼこした塊に見える。
+    // 上に液があるセルを「液の中」とみなす。液面より上の空気と、下の部屋の空気は残る
+    let gl = length(G.grav.xyz);
+    if (air && gl > 1e-9) {
+      let up = -G.grav.xyz/gl;
+      for (var k = 1; k <= 6; k++) {
+        let y = x + up*(f32(k)*G.org.w);
+        let cy = vec3i(floor(idx3(y)));
+        if (fluid(cy) && U[fid(cy)].w > 0.85) { air = false; break; }
+      }
+    }
+    // 泡のすぐまわりのセルは描かない（泡は本体の描画で球として描く。重ねると輪郭がでこぼこになる）
     for (var b = 0u; b < NBUB; b++) {
       let q = bub[b];
       if (q.w > 0.0 && distance(x, q.xyz) < q.w + 2.0*G.fine.x) { air = false; }
@@ -2141,28 +2156,6 @@ fn gsAirDraw(@builtin(global_invocation_id) gid: vec3u) {
   }
   rpos[G.dim.w + g] = select(vec4f(0.0, 1e5, 0.0, 1.0), vec4f(x, 1.0), air);
 
-  // 泡は、セルの球とは別に、泡ごとに球を33個（中心と、正二十面体・正十二面体の頂点）置いて丸く描く。
-  // 描く球の半径は決まった値（G.org.x）なので、束の外側が泡の半径になるように内側へ寄せる
-  if (g < NBUB*BUB_SPH) {
-    let q = bub[g / BUB_SPH];
-    let k = g % BUB_SPH;
-    var o = vec3f(0.0);
-    if ((k >= 1u && k < 13u) || k >= 21u) {
-      // (0, ±a, ±b) を3軸に回したもの。正二十面体の頂点と、正十二面体の残りの頂点
-      let ico = k < 13u;
-      let A = select(0.3568221, 0.5257311, ico); let Bc = select(0.9341724, 0.8506508, ico);
-      let t = select(k - 21u, k - 1u, ico);
-      let sa = select(-A, A, (t & 1u) == 0u);
-      let sb = select(-Bc, Bc, (t & 2u) == 0u);
-      let m = t / 4u;
-      o = select(select(vec3f(sb, 0.0, sa), vec3f(sa, sb, 0.0), m == 1u), vec3f(0.0, sa, sb), m == 0u);
-    } else if (k >= 13u) {
-      let t = k - 13u;   // 立方体の角
-      o = vec3f(select(-1.0, 1.0, (t & 1u) == 0u), select(-1.0, 1.0, (t & 2u) == 0u), select(-1.0, 1.0, (t & 4u) == 0u))*0.5773503;
-    }
-    let rr = max(q.w - G.org.x, 0.0);
-    rpos[G.dim.w + nc + g] = select(vec4f(0.0, 1e5, 0.0, 1.0), vec4f(q.xyz + o*rr, 1.0), q.w > 0.0);
-  }
 }
 
 /* ---------- 計測（調整用） ----------
@@ -2401,7 +2394,7 @@ struct Uni {
   camUp    : vec4f,   // xyz = カメラ上, w = アスペクト比
   camFwd   : vec4f,   // xyz = カメラ前
   camPos   : vec4f,   // xyz = カメラ位置, w = 時刻
-  grav     : vec4f,   // xyz = 重力の逆向き
+  grav     : vec4f,   // xyz = 重力の逆向き, w = 液の中を通る距離の下限（色の吸収用）
   liqA     : vec4f,   // rgb = 液体に残る色, a = 吸収の強さ
   glsA     : vec4f,   // rgb = ガラスに残る色, a = 吸収の強さ
   mat      : vec4f,   // x = ガラス屈折率, y = 液体屈折率, z = ガラス粗さ, w = 露出
@@ -2583,6 +2576,8 @@ ${WGSL_UNI}
 @group(0) @binding(4) var liqThick: texture_2d<f32>;
 @group(0) @binding(5) var gasDepth: texture_2d<f32>;
 @group(0) @binding(6) var gasThick: texture_2d<f32>;
+// 泡（物理の gsBubble と同じ配列）。xyz 中心, w 半径（0 は空き）
+@group(0) @binding(7) var<storage, read> bubs: array<vec4f>;
 
 const EPS   : f32 = ${f(M.eps)};
 const NEPS  : f32 = ${f(M.normalEps)};
@@ -2668,7 +2663,26 @@ fn normalFromDepth(q: vec3f, isGas: bool) -> vec3f {
 
 // body = 容器, liq = 液体（空気をくり抜いたもの）, cav = 空洞,
 // liqS = 液体のスラブ, gasS = 空気のスラブ
-struct FD { body: f32, liq: f32, cav: f32, liqS: f32, gasS: f32 };
+// bub = 泡（球）までの距離, bubN = いちばん近い泡の中心から外向きの向き
+struct FD { body: f32, liq: f32, cav: f32, liqS: f32, gasS: f32, bub: f32, bubN: vec3f };
+
+// 泡は画面空間のスラブではなく、本物の球として持つ。
+// 面の向きが正確に出るので、縁の全反射や中の景色の反転がくっきり見える
+fn bubbleDist(p: vec3f, f: ptr<function, FD>) {
+  (*f).bub = 1.0;
+  (*f).bubN = vec3f(0.0, 1.0, 0.0);
+  for (var b = 0u; b < 16u; b++) {
+    let q = bubs[b];
+    if (q.w <= 0.0) { continue; }
+    let v = p - q.xyz;
+    let l = length(v);
+    let d = l - q.w;
+    if (d < (*f).bub) {
+      (*f).bub = d;
+      (*f).bubN = select(vec3f(0.0, 1.0, 0.0), v/l, l > 1e-6);
+    }
+  }
+}
 
 fn fields(p: vec3f) -> FD {
   var f: FD;
@@ -2677,6 +2691,7 @@ fn fields(p: vec3f) -> FD {
   f.cav  = c;
   f.body = max(o, -c);
   // 空洞の外に中身はないので、重い画面空間の判定を省く
+  f.bub = 1.0; f.bubN = vec3f(0.0, 1.0, 0.0);
   if (c > 0.0) { f.liqS = 1.0; f.gasS = 1.0; f.liq = c; return f; }
 
   let q = projUV(p);
@@ -2701,8 +2716,9 @@ fn fields(p: vec3f) -> FD {
   }
   f.liqS = liqS;
   f.gasS = gasS;
-  // 液体 = 空洞 ∩ 液体スラブ ∩ ¬空気スラブ
-  f.liq  = max(max(c, liqS), -gasS);
+  // 液体 = 空洞 ∩ 液体スラブ ∩ ¬空気スラブ ∩ ¬泡
+  bubbleDist(p, &f);
+  f.liq  = max(max(max(c, liqS), -gasS), -f.bub);
   return f;
 }
 fn ifaceDist(p: vec3f) -> f32 {
@@ -2847,7 +2863,15 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
       if (t > SEGMAX) { break; }
     }
     if (med == MED_GLASS)    { thr *= exp(-gExt*t); }
-    else if (med == MED_LIQ) { thr *= exp(-lExt*t); }
+    // 薄い液（落ちる紐、しずく、下に溜まった液）は、通った距離が短くても
+    // U.grav.w までは通ったものとして色を吸わせ、上の液と同じ色に見せる。
+    // 薄いかどうかは、その場所の液の厚み（画面の奥行き方向の合計）で決める。
+    // 区間の長さで決めると、上の部屋の泡の通り道のすき間で短く区切られた所が
+    // 濃い点になってしまう
+    else if (med == MED_LIQ) {
+      let th = liqAtUV(projUV(pos).xy).y;
+      thr *= exp(-lExt*max(t, U.grav.w - th));
+    }
 
     if (!hit) {
       if (med == MED_OUT) { rad += thr*bgColor(dir)*U.bnd.w; }
@@ -2863,6 +2887,8 @@ fn hitCyl(ro: vec3f, rd: vec3f, R: f32, H: f32) -> vec2f {
     var nrm: vec3f;
     if (abs(f.body) <= abs(f.liq)) {
       nrm = gradBody(pos);                              // 容器の内壁
+    } else if (-f.bub >= max(max(f.cav, f.liqS), -f.gasS) - 1e-5) {
+      nrm = f.bubN;                                     // 泡の球面（正確な向き）
     } else if (f.cav > -U.fluid.x*1.6) {
       // 壁のすぐそばは必ず壁の法線を使う。画素ごとに壁と液面の法線が
       // 切り替わると、壁ぎわに縦縞が出てしまう。
@@ -3099,8 +3125,7 @@ const Sim = {
     this.bufItm = mk(this.cells*C.cellCap*4);
     // 描画用（時間方向にならした位置）。空気を格子で持つときは、後ろに泡を描く球を置く
     this.grid = GRID_AIR();
-    // 空気のセルの球のあとに、泡を描く球（16個 × 33）を置く
-    if (this.grid) { this.gridDims(); this.nGas = this.nCells + 16*33; }
+    if (this.grid) { this.gridDims(); this.nGas = this.nCells; }
     this.bufRender = mk((this.N + (this.grid ? this.nGas : 0))*16);
     this.bufStat = dev.createBuffer({ size: 32,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
@@ -3667,6 +3692,7 @@ const Gpu = {
       { binding:4, resource: this.thickLView },
       { binding:5, resource: this.gasAView },
       { binding:6, resource: this.thickGView },
+      { binding:7, resource:{ buffer: (Sim.gb && Sim.gb.bub) || this.noBub() } },
     ]});
     this.bgPost = dev.createBindGroup({ layout: this.pipePost.getBindGroupLayout(0), entries:[
       { binding:0, resource:{ buffer: this.ub } },
@@ -3681,6 +3707,12 @@ const Gpu = {
     this.bgSmLY = smBG(this.pipeSmoothY, this.liqBView);
     this.bgSmGX = smBG(this.pipeSmoothX, this.gasAView);
     this.bgSmGY = smBG(this.pipeSmoothY, this.gasBView);
+  },
+
+  // 空気を粒子で持つとき（泡の配列がないとき）の空の配列
+  noBub(){
+    if (!this._noBub) this._noBub = this.dev.createBuffer({ size: 17*16, usage: GPUBufferUsage.STORAGE });
+    return this._noBub;
   },
 
   render(dt, gravityDir){
@@ -3863,7 +3895,7 @@ function writeUniforms(time){
   const VIEWS = { phase: 1, gas: 2, liq: 3 };
   U[56]=F[0];  U[57]=F[1];  U[58]=F[2];  U[59]=VIEWS[QS.get('view')] || 0;
   U[60]=P[0];  U[61]=P[1];  U[62]=P[2];  U[63]=time;
-  U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=0;
+  U[64]=gUp[0]; U[65]=gUp[1]; U[66]=gUp[2]; U[67]=L.tintMin;
   U[68]=L.color[0]; U[69]=L.color[1]; U[70]=L.color[2]; U[71]=L.absorb;
   U[72]=G.color[0]; U[73]=G.color[1]; U[74]=G.color[2]; U[75]=G.absorb;
   U[76]=G.ior; U[77]=L.ior; U[78]=G.roughness; U[79]=CONFIG.view.exposure;
